@@ -68,11 +68,14 @@ jobs:
     permissions:
       contents: write
       # Moving the preview tag is a ref update pointing at a commit that carries
-      # this very workflow file. GitHub blocks a ref update like that unless the
-      # token may write workflows, so the default GITHUB_TOKEN is refused with
-      # "refusing to allow a GitHub App to create or update workflow". The gate
-      # above is a full green test suite, so this is the token the job needs.
-      workflows: write
+      # this very workflow file, and GITHUB_TOKEN is never allowed to touch
+      # anything under .github/workflows/. There is no such permission scope:
+      # naming an unknown key here makes GitHub reject the whole file as invalid
+      # ("Unexpected value 'workflows'"), and permissions cannot grant it
+      # anyway. If the tag push below fails again with "refusing to allow a
+      # GitHub App to create or update workflow", the fix is a PAT carrying the
+      # workflows scope, passed to actions/checkout's token input -- not a
+      # permissions entry.
     steps:
       - uses: actions/checkout@v4
         with:
