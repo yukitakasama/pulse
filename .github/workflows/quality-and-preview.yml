@@ -1,0 +1,164 @@
+name: Quality gate and preview release
+
+# Runs the full local quality gate on every push, then publishes a rolling
+# preview release for manual testing. release.yml stays the only path that
+# publishes an official version tag; this one never creates a v[0-9]* tag.
+on:
+  push:
+    # main is the only branch here. A push event runs the copy of this file that
+    # lives on the pushed ref, and feature branches deliberately do not carry it
+    # (it is fork-only and must stay out of upstream pull requests), so listing
+    # them would be dead configuration. Dispatch one by hand instead:
+    #   gh workflow run quality-and-preview.yml --ref <branch>
+    branches:
+      - main
+    # v1.0.53 and friends are release.yml's business, and a tag push would
+    # otherwise build the same commit twice.
+    tags-ignore: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  # A newer push makes an in-flight build obsolete; only the newest commit for
+  # a ref needs a verdict.
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Build and test (${{ matrix.channel }})
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [windows, win81]
+    steps:
+      - uses: actions/checkout@v4
+      # The same script release.yml uses: it compiles every test target, runs
+      # the whole suite plus the selftest cases, and only then strips the test
+      # suite and builds the installer and portable ZIP. A failing test throws
+      # before packaging, so this job is the gate the preview depends on.
+      - name: Build, test and package
+        shell: pwsh
+        run: ./scripts/build_release_ci.ps1 -Channel '${{ matrix.channel }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.channel }}
+          path: |
+            dist/PulseSetup-*.exe
+            dist/Pulse-*-portable-win-x64.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostics-${{ matrix.channel }}
+          path: |
+            bench_data/win81_imports.json
+            bench_data/selftest_1b2_last.log
+            build-ci/*.log
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish preview release
+    needs: quality
+    runs-on: windows-2022
+    timeout-minutes: 15
+    # Disabled on this throwaway branch only. This branch exists solely to give
+    # the quality job a ref that carries this file, so that a feature branch can
+    # be gated by hand; it must never move the rolling `preview` release, which
+    # belongs to main.
+    if: false
+    permissions:
+      contents: write
+      # Moving the preview tag is a ref update pointing at a commit that carries
+      # this very workflow file, and GITHUB_TOKEN is never allowed to touch
+      # anything under .github/workflows/. There is no such permission scope:
+      # naming an unknown key here makes GitHub reject the whole file as invalid
+      # ("Unexpected value 'workflows'"), and permissions cannot grant it
+      # anyway. If the tag push below fails again with "refusing to allow a
+      # GitHub App to create or update workflow", the fix is a PAT carrying the
+      # workflows scope, passed to actions/checkout's token input -- not a
+      # permissions entry.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          path: dist
+          merge-multiple: true
+
+      # GitHub adds its own "Source code (zip/tar.gz)" links, but those are not
+      # downloadable assets. Ship explicit archives so a tester can grab the
+      # exact source the binaries were built from in one click.
+      - name: Create source archives
+        shell: pwsh
+        run: |
+          $sha = '${{ github.sha }}'
+          $short = $sha.Substring(0, 7)
+          $prefix = "Pulse-$short"
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          git archive --format=zip --output="dist/$prefix-source.zip" --prefix="$prefix/" HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'git archive (zip) failed' }
+          git archive --format=tar.gz --output="dist/$prefix-source.tar.gz" --prefix="$prefix/" HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'git archive (tar.gz) failed' }
+          "SOURCE_ZIP=dist/$prefix-source.zip" | Out-File -FilePath dist/source-env.txt -Encoding utf8
+          "SOURCE_TGZ=dist/$prefix-source.tar.gz" | Out-File -FilePath dist/source-env.txt -Encoding utf8 -Append
+          Get-ChildItem dist | Select-Object Name, Length
+
+      # The preview channel is a single rolling `preview` tag rather than one
+      # tag per commit, so the download URL stays stable. Force-move the tag to
+      # this commit and clobber the previous assets instead of piling up
+      # releases.
+      - name: Move the preview tag and assemble notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sha = '${{ github.sha }}'
+          $short = $sha.Substring(0, 7)
+          $version = (Get-Content version.txt -Raw).Trim()
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Deleting a release must NOT clean up the tag: the tag has to survive
+          # pointing at this commit, otherwise gh would recreate it at the
+          # default branch head and the assets would not match the notes.
+          if (gh release view preview --json tagName 2>$null) {
+            gh release delete preview --yes
+          }
+          git tag --force preview $sha
+          git push --force origin refs/tags/preview
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not move the preview tag. A GitHub App may only update workflow files when the workflows permission is granted; check the permissions block of this job.'
+          }
+          $source = @{}
+          Get-Content dist/source-env.txt | ForEach-Object {
+            if ($_ -match '^(?<key>[A-Z_]+)=(?<value>.+)$') { $source[$Matches.key] = $Matches.value }
+          }
+          $assets = @(Get-ChildItem dist -File |
+            Where-Object { $_.Extension -in '.exe', '.zip', '.gz' } |
+            ForEach-Object { $_.FullName })
+          if ($assets.Count -lt 4) { throw "Expected installer, portable ZIP and two source archives, got $($assets.Count)" }
+          @"
+          Preview build of commit $sha ($version), produced by the quality gate in this run.
+
+          Not an official release. It is published so a real machine can install
+          and exercise the change; treat it as a scratch build.
+
+          - Windows 10/11 x64 installer: ``PulseSetup-$version.exe``
+          - Windows 8.1 x64 installer (candidate channel): ``PulseSetup-$version-win81.exe``
+          - Windows 10/11 x64 portable ZIP: ``Pulse-$version-portable-win-x64.zip``
+          - Source archives: ``$($source['SOURCE_ZIP'] | Split-Path -Leaf)`` and ``$($source['SOURCE_TGZ'] | Split-Path -Leaf)``
+
+          The Windows 8.1 build is an unsigned compatibility candidate.
+          The in-app updater ignores releases from this fork: update manifests
+          need the maintainer's signing key, which is not present here.
+          "@ | Set-Content -LiteralPath dist/notes.md -Encoding utf8
+          gh release create preview --verify-tag --title "Pulse preview $short ($version)" `
+            --notes-file dist/notes.md --prerelease @assets
+          gh release view preview --json url,tagName,isPrerelease,assets `
+            --jq '"release: \(.url)tag=\(.tagName) prerelease=\(.isPrerelease)", (.assets[] | "  asset: \(.name) \(.size) bytes")'
