@@ -5,9 +5,13 @@ name: Quality gate and preview release
 # publishes an official version tag; this one never creates a v[0-9]* tag.
 on:
   push:
+    # main is the only branch here. A push event runs the copy of this file that
+    # lives on the pushed ref, and feature branches deliberately do not carry it
+    # (it is fork-only and must stay out of upstream pull requests), so listing
+    # them would be dead configuration. Dispatch one by hand instead:
+    #   gh workflow run quality-and-preview.yml --ref <branch>
     branches:
       - main
-      - 91-preview-follow-selection
     # v1.0.53 and friends are release.yml's business, and a tag push would
     # otherwise build the same commit twice.
     tags-ignore: ['v[0-9]*']
