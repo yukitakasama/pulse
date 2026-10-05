@@ -1,0 +1,154 @@
+name: Build image preview pack
+
+# pulse-imgpack.exe with libheif + libde265 + dav1d (HEIC / AVIF), libjxl and
+# OpenEXR for Pulse's optional image preview pack. Run manually; a tag
+# "pack-images-<version>" publishes the files and their manifest to a release
+# of that name, where Pulse's pack installer finds them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pack_version:
+        description: Pack version (e.g. 1.0.0)
+        required: true
+        default: '1.0.0'
+  push:
+    tags: ['pack-images-[0-9]*']
+
+permissions:
+  contents: read
+
+env:
+  # The vcpkg ports the pack was validated with; packs/images/vcpkg.json
+  # overlays libheif on top of them.
+  VCPKG_COMMIT: d46283cf33cf5de7bd88e12156ce03882be1f179
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Resolve version
+        id: version
+        run: |
+          if ('${{ github.ref }}' -like 'refs/tags/pack-images-*') {
+            "value=$('${{ github.ref_name }}' -replace '^pack-images-','')" >> $env:GITHUB_OUTPUT
+          } else {
+            "value=${{ inputs.pack_version }}" >> $env:GITHUB_OUTPUT
+          }
+      - name: vcpkg
+        run: |
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
+          git -C "$env:RUNNER_TEMP\vcpkg" checkout $env:VCPKG_COMMIT
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+      - uses: actions/cache@v4
+        with:
+          path: build/imgpack/binarycache
+          key: imgpack-${{ env.VCPKG_COMMIT }}-${{ hashFiles('packs/images/vcpkg.json', 'packs/images/ports/**', 'packs/images/triplets/**') }}
+      - name: Build
+        # build.ps1 runs the smoke test (hevc=1 av1=1) and checks that every
+        # DLL the pack needs is shipped in it.
+        run: |
+          & packs/images/build.ps1 -VcpkgRoot "$env:RUNNER_TEMP\vcpkg" -Work build/imgpack
+          if ($LASTEXITCODE) { throw "build.ps1 failed ($LASTEXITCODE)" }
+      - name: Check licences
+        # Decoders only: libheif's GPL x265 / x264 encoders and the other
+        # encoder plugins must not end up in the pack.
+        run: |
+          $bad = Get-ChildItem build/imgpack/pack -File | Where-Object { $_.Name -match 'x265|x264|openh264|rav1e|svt|aom' }
+          if ($bad) { throw "encoder in the image pack: $($bad.Name -join ', ')" }
+      - name: Package
+        run: |
+          $version = '${{ steps.version.outputs.value }}'
+          $pack = 'build/imgpack/pack'
+          # Pulse downloads each file as <name>.lzms (Windows Compression API,
+          # present since Windows 8) and checks the hashes pinned in its source.
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.ComponentModel;
+          using System.Runtime.InteropServices;
+          public static class Lzms {
+              [DllImport("cabinet.dll", SetLastError = true)] static extern bool CreateCompressor(uint algorithm, IntPtr routines, out IntPtr handle);
+              [DllImport("cabinet.dll", SetLastError = true)] static extern bool Compress(IntPtr handle, byte[] data, UIntPtr size, byte[] output, UIntPtr outputSize, out UIntPtr written);
+              [DllImport("cabinet.dll")] static extern bool CloseCompressor(IntPtr handle);
+              public static byte[] Pack(byte[] data) {
+                  IntPtr handle;
+                  if (!CreateCompressor(5, IntPtr.Zero, out handle)) throw new Win32Exception();
+                  try {
+                      UIntPtr needed;
+                      Compress(handle, data, (UIntPtr)data.Length, null, UIntPtr.Zero, out needed);
+                      byte[] output = new byte[(int)needed.ToUInt64()];
+                      UIntPtr written;
+                      if (!Compress(handle, data, (UIntPtr)data.Length, output, (UIntPtr)output.Length, out written)) throw new Win32Exception();
+                      Array.Resize(ref output, (int)written.ToUInt64());
+                      return output;
+                  } finally { CloseCompressor(handle); }
+              }
+          }
+          '@
+          $sha = { param($p) (Get-FileHash $p -Algorithm SHA256).Hash.ToLower() }
+          $files = Get-ChildItem $pack -File | Sort-Object Name | ForEach-Object {
+            $packed = "$($_.Name).lzms"
+            [IO.File]::WriteAllBytes((Join-Path $PWD $packed), [Lzms]::Pack([IO.File]::ReadAllBytes($_.FullName)))
+            [ordered]@{
+              name = $_.Name; size = $_.Length; sha256 = & $sha $_.FullName
+              packed = [ordered]@{ name = $packed; size = (Get-Item $packed).Length; sha256 = & $sha $packed }
+            }
+          }
+          # The block to paste into src/app/pack_catalog.h.
+          $base = "https://github.com/${{ github.repository }}/releases/download/pack-images-$version/"
+          $lines = @("// pack-images-$version, generated by .github/workflows/preview-pack-images.yml",
+                     'inline constexpr PackFile kImagePackFiles[] = {')
+          foreach ($f in $files) {
+            $lines += "    {L`"$($f.name)`", $($f.size), L`"$($f.sha256)`", $($f.packed.size), L`"$($f.packed.sha256)`"},"
+          }
+          $lines += '};'
+          $lines += "inline constexpr PackRelease kImagePackRelease{L`"images`", L`"$version`", L`"$base`","
+          $lines += '    kImagePackFiles, sizeof(kImagePackFiles) / sizeof(kImagePackFiles[0])};'
+          $lines | Set-Content -Encoding utf8 pack-catalog.inc
+          "### pack_catalog.h`n``````cpp" | Add-Content $env:GITHUB_STEP_SUMMARY
+          $lines | Add-Content $env:GITHUB_STEP_SUMMARY
+          '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          $manifest = [ordered]@{
+            id = 'images'; version = $version; license = 'LGPL-3.0-only AND BSD-3-Clause AND MIT'
+            files = $files
+            min_pulse = '1.0.53'
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 "pulse-pack-images-$version.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pack-images
+          path: |
+            pulse-pack-images-*.json
+            *.lzms
+            pack-catalog.inc
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/pack-images-')
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pack-images
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          # --latest=false: Pulse's updater reads releases/latest/download/update-manifest.json,
+          # so a pack release must never become the repository's "latest" release.
+          gh release create $tag --repo '${{ github.repository }}' --latest=false --title "Image preview pack $($tag -replace 'pack-images-','')" `
+            --notes 'Optional HEIC / AVIF / JPEG XL / OpenEXR decoders for Pulse previews. Installed from Settings > Preview packs.' `
+            (Get-ChildItem pulse-pack-images-*, *.lzms, pack-catalog.inc)

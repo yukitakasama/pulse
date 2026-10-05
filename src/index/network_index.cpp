@@ -374,52 +374,10 @@ bool MatchNetworkRecord(const NetworkRecord& record, std::wstring_view path,
     const bool is_dir = (record.flags & kRecordDirectory) != 0;
     if (folders_only && !is_dir) return false;
     if (query.groups.empty()) return true;
-    auto match_term = [&](const Term& term) {
-        if (term.folder && !is_dir) return false;
-        if (term.file && is_dir) return false;
-        if (!term.exts.empty()) {
-            bool ok = MatchExt(name.data(), static_cast<uint32_t>(name.size()), term);
-            if (term.ext_not) ok = !ok;
-            if (!ok) return false;
-        }
-        if (term.size_how != SizeHow::Any) {
-            bool ok = MatchSize(record.size, term);
-            if (term.size_not) ok = !ok;
-            if (!ok) return false;
-        }
-        if (term.date_how != DateHow::Any) {
-            bool ok = record.mtime && MatchDate(record.mtime, term);
-            if (term.date_not) ok = !ok;
-            if (!ok) return false;
-        }
-        if (term.name_how != NameHow::Any) {
-            bool ok = false;
-            if (!term.name_in_path) {
-                ok = MatchName(name.data(), static_cast<uint32_t>(name.size()), term);
-            } else if (term.name_how == NameHow::Wildcard) {
-                ok = WildcardFolded(path.data(), static_cast<uint32_t>(path.size()), term.name);
-            } else {
-                size_t begin = 0;
-                while (begin < path.size()) {
-                    const size_t end = path.find(L'\\', begin);
-                    const size_t length = (end == std::wstring_view::npos ? path.size() : end) - begin;
-                    if (length && MatchName(path.data() + begin, static_cast<uint32_t>(length), term)) {
-                        ok = true;
-                        break;
-                    }
-                    if (end == std::wstring_view::npos) break;
-                    begin = end + 1;
-                }
-            }
-            if (term.name_not) ok = !ok;
-            if (!ok) return false;
-        }
-        return true;
-    };
     for (const auto& group : query.groups) {
         bool matched = true;
         for (const auto& term : group) {
-            if (!match_term(term)) {
+            if (!MatchTerm(path, name, is_dir, record.size, record.mtime, term)) {
                 matched = false;
                 break;
             }
@@ -1770,7 +1728,7 @@ SearchResult SelectLiveNetworkHits(const Query& query, const LiveNetworkMatches&
 }
 
 SearchResult MergeSearchResults(const Query& query, SearchResult local,
-                                SearchResult network) {
+                                SearchResult network, bool deduplicate_paths) {
     SearchResult result;
     result.error = local.error ? local.error : network.error;
     result.total = local.total + network.total;
@@ -1782,6 +1740,18 @@ SearchResult MergeSearchResults(const Query& query, SearchResult local,
         std::sort(result.hits.begin(), result.hits.end(), [&](const Hit& a, const Hit& b) {
             return BetterHit(a, b, query, compiled);
         });
+    }
+    if (deduplicate_paths) {
+        std::vector<Hit> unique;
+        unique.reserve(result.hits.size());
+        for (auto& hit : result.hits) {
+            if (std::any_of(unique.begin(), unique.end(), [&](const Hit& existing) {
+                return CompareStringOrdinal(existing.path.c_str(), -1, hit.path.c_str(), -1, TRUE) == CSTR_EQUAL;
+            })) {
+                if (result.total) --result.total;
+            } else unique.push_back(std::move(hit));
+        }
+        result.hits = std::move(unique);
     }
     const size_t begin = (std::min)(query.offset, result.hits.size());
     const size_t end = (std::min)(result.hits.size(), begin + query.limit);

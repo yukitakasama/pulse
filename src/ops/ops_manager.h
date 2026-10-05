@@ -36,6 +36,8 @@ enum class CollisionPolicy { System, Replace, KeepBoth };
 enum class OpPhase { Queued, Scanning, WaitingForConflict, Running, Paused,
                      Verifying, Cancelling, Completed, Failed };
 enum class ConflictChoice { Cancel, Replace, Skip, KeepBoth };
+enum class AuthorizationState { None, Requesting, ActionRequired };
+enum class AuthorizationChoice { Cancel, Retry, Skip };
 
 struct ConflictItemInfo {
     uint64_t token = 0;
@@ -80,6 +82,9 @@ struct UndoEntry {
 
 struct OpStatus {
     bool active = false;
+    bool can_pause = true;
+    AuthorizationState authorization = AuthorizationState::None;
+    bool can_skip_authorization = false;
     OpType type = OpType::Copy;
     OpPhase phase = OpPhase::Completed;
     uint64_t task_id = 0;
@@ -106,6 +111,8 @@ struct CompletedOperation {
     OpType type = OpType::Copy;
     std::vector<std::wstring> sources;
     std::vector<std::wstring> destinations;
+    bool refresh_only = false;
+    std::vector<std::wstring> refresh_directories;
 };
 
 struct RecoveryEntry {
@@ -164,6 +171,7 @@ public:
     void ResumeCurrent();
     std::optional<ConflictItemInfo> PendingConflict() const;
     void ResolveConflict(uint64_t token, ConflictChoice choice, bool apply_to_all);
+    void ResolveAuthorization(uint64_t task_id, bool retry);
     // Re-queue the operation that failed on a locked item (status.task_id).
     // close_owners = end the closable lock owners on the worker first. Items
     // that are already gone are skipped for delete/move.
@@ -261,6 +269,10 @@ private:
     void RunShellOp(const OpRequest& req, uint64_t task_id);
     bool WaitShellDone(uint32_t id, uint32_t& hr, bool& cancelled, std::wstring& error);
     void RunTransfer(const OpRequest& req, uint64_t task_id);
+    void RunAuthorizedTransfer(const OpRequest& req, uint64_t task_id);
+    void RunAuthorizedDelete(const OpRequest& req, uint64_t task_id);
+    AuthorizationChoice WaitForAuthorization(uint64_t task_id, const std::wstring& error,
+                                            const std::wstring& source);
     LockReport ProbeLock(const OpRequest& req, uint64_t task_id, HRESULT hr,
                          const std::wstring& error);
     bool PrepareLockRetry(OpRequest& req, uint64_t task_id);
@@ -315,6 +327,8 @@ private:
     uint64_t resolved_conflict_token_ = 0;
     ConflictChoice resolved_conflict_choice_ = ConflictChoice::Cancel;
     bool resolved_conflict_apply_all_ = false;
+    uint64_t authorization_task_ = 0;
+    std::optional<AuthorizationChoice> authorization_choice_;
 
     // Completion sync for the op currently in flight.
     std::mutex done_mutex_;

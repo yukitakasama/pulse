@@ -520,7 +520,7 @@ private:
         SetWindowTheme(edit, L"", L"");
         const auto& cue = l10n::Get(cue_id);
         SendMessageW(edit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(cue.c_str()));
-        if (!compositor_.LumaTextEnabled())
+        if (!compositor_.CustomEditEnabled())
             SetLayeredWindowAttributes(edit, 0, 255, LWA_ALPHA);
         if (font_) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
         SetWindowSubclass(edit, EditProc, static_cast<UINT_PTR>(id), reinterpret_cast<DWORD_PTR>(this));
@@ -546,17 +546,7 @@ private:
                   static_cast<int>(std::lround(cell.top)) };
         const int w = std::max(40, static_cast<int>(std::lround(cell.right - cell.left - 20.0f * scale_)));
         const int cell_h = std::max(18, static_cast<int>(std::lround(cell.bottom - cell.top)));
-        int line_h = cell_h;
-        if (font_) {
-            HDC hdc = GetDC(hwnd);
-            HFONT old = static_cast<HFONT>(SelectObject(hdc, font_));
-            TEXTMETRICW tm{};
-            GetTextMetricsW(hdc, &tm);
-            SelectObject(hdc, old);
-            ReleaseDC(hwnd, hdc);
-            line_h = std::max(1, static_cast<int>(tm.tmHeight));
-        }
-        line_h = std::min(line_h, cell_h);
+        const int line_h = EditLineHeight(hwnd, font_, cell_h);
         pt.y += std::max(0, (cell_h - line_h) / 2);
         SetWindowPos(hwnd, HWND_TOP, pt.x, pt.y, w, line_h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         // Layered children need an initial bitmap before they can receive clicks.
@@ -929,16 +919,7 @@ private:
             painter_.SetCompositor(&compositor_);
             painter_.SetScale(scale_);
             backdrop_ = ApplyBackdrop(hwnd_, dark_);
-            const int height = -std::max(1, static_cast<int>(std::lround(14.0f * scale_)));
-            const wchar_t* family = typography::PreferredTextFamily();
-            font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, family);
-            if (!font_) {
-                font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                    DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            }
+            font_ = typography::CreateEditFont(scale_);
             if (edit_brush_) { DeleteObject(edit_brush_); edit_brush_ = nullptr; }
             edit_brush_ = CreateSolidBrush(dark_ ? RGB(30, 30, 30) : RGB(255, 255, 255));
             edit_kw_ = CreateField(1, content_mode_ ? spec_.content : spec_.name, KeywordHint());

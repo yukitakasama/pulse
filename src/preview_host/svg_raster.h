@@ -1,22 +1,17 @@
-// svg_raster.h — Direct2D rasterization of SVG documents for the preview host.
+// System Direct2D SVG rasterization for the isolated preview host.
 #pragma once
-
 #include <windows.h>
 #include <string>
 #include <vector>
 
 namespace pulse::preview {
-
-// Rasterizes an SVG file into 32bpp premultiplied BGRA pixels — the same format
-// the WIC path produces, so the UI side needs no special handling. max_edge caps
-// the longest edge of the result while keeping the document's aspect ratio;
-// source_width/source_height report its intrinsic size. Returns false and fills
-// *error when the file is unreadable, larger than the size budget, not an SVG
-// document, or when no Direct2D device is available in this process.
+// Rejects markup outside the documented Direct2D subset before silent omission.
+// XmlLite is loaded dynamically; UTF-8/UTF-16 are checked without reading external resources.
+bool IsSvgSupportedForDirect2D(const std::vector<unsigned char>& bytes, std::wstring& error);
+// Returns premultiplied BGRA. Unsupported text, styles, filters, external resources
+// and animation fail explicitly so callers can preserve the source and reason.
+// Native SVG rendering requires ID2D1DeviceContext5 (Windows 10 1703 or newer).
 bool RasterizeSvgFile(const std::wstring& path, UINT max_edge,
-                      std::vector<unsigned char>& pixels,
-                      UINT& width, UINT& height, UINT& stride,
-                      UINT& source_width, UINT& source_height,
-                      std::wstring* error);
-
+    std::vector<unsigned char>& pixels, UINT& width, UINT& height, UINT& stride,
+    UINT& source_width, UINT& source_height, std::wstring* error);
 } // namespace pulse::preview

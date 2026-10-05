@@ -68,7 +68,7 @@ public:
                                      uint64_t completed_at, bool partial = false);
 
     void OpenMenu(std::vector<ui::FluentMenuItem> base_items);
-    void NotePatchedDisplay() { menu_com_items_ = com_items_; }
+    void NotePatchedDisplay() { menu_com_items_ = com_items_; menu_static_verbs_ = static_verbs_; }
     void CloseMenu() noexcept { menu_open_ = false; }
     bool menu_open() const noexcept { return menu_open_; }
     const std::vector<ui::FluentMenuItem>& base_items() const noexcept {
@@ -95,6 +95,7 @@ private:
     std::vector<ops::ShellMenuItem> com_items_;
     std::vector<ops::ShellMenuItem> menu_com_items_;
     std::vector<StaticVerb> static_verbs_;
+    std::vector<StaticVerb> menu_static_verbs_;
     std::wstring extension_;
     std::vector<ui::FluentMenuItem> base_items_;
     std::unordered_map<std::wstring, std::vector<StaticVerb>> static_cache_;

@@ -269,6 +269,41 @@ int wmain(int argc, wchar_t** argv) {
     l10n::SetLanguage(L"zh-CN");
     fprintf(stderr, "[test] start\n");
 
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--transfer-routing") {
+        const auto root = std::filesystem::path(SandboxRoot()).parent_path() /
+            (L"transfer-routing-" + std::to_wstring(GetCurrentProcessId()));
+        const auto source = root / L"source";
+        const auto target = root / L"target";
+        std::filesystem::create_directories(source);
+        std::filesystem::create_directories(target);
+        const auto file = source / L"sample.txt";
+        const auto copy = target / L"sample.txt";
+        const char content[] = "permission routing regression";
+        Check(MakeFile(file.wstring(), content, sizeof(content)), L"create isolated transfer fixture");
+        g_ops.Start([] {});
+        auto status = RunOp(SimpleOp(ops::OpType::Copy, {file.c_str()}, target.c_str()));
+        Check(status.phase == ops::OpPhase::Completed && Exists(copy.wstring()) &&
+            Exists(file.wstring()) && status.can_pause, L"ordinary copy retains fast path and pause capability");
+        const auto moved_dir = root / L"moved";
+        std::filesystem::create_directories(moved_dir);
+        status = RunOp(SimpleOp(ops::OpType::Move, {copy.c_str()}, moved_dir.c_str()));
+        Check(status.phase == ops::OpPhase::Completed && !Exists(copy.wstring()) &&
+            Exists((moved_dir / L"sample.txt").wstring()), L"ordinary move retains fast path");
+        const auto completed = g_ops.Status().completed_ops;
+        Check(g_ops.CanUndo(), L"ordinary move remains undoable");
+        g_ops.Undo();
+        Check(WaitOpDone(completed) && Exists(copy.wstring()) &&
+            !Exists((moved_dir / L"sample.txt").wstring()), L"move undo restores original location");
+        g_ops.Stop();
+        std::filesystem::remove(file);
+        std::filesystem::remove(copy);
+        std::filesystem::remove(source);
+        std::filesystem::remove(target);
+        std::filesystem::remove(moved_dir);
+        std::filesystem::remove(root);
+        return g_fail ? 1 : 0;
+    }
+
     if (argc > 1 && std::wstring(argv[1]) == L"--duplicate-cleanup-audit") {
         const auto base = std::filesystem::path(SandboxRoot()).parent_path();
         const auto fixture = base / (L"duplicate-cleanup-ops-" + std::to_wstring(GetCurrentProcessId()) +

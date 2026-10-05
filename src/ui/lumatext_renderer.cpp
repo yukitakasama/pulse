@@ -8,6 +8,7 @@
 #include <imm.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <cwchar>
@@ -172,6 +173,28 @@ struct LumaTextRenderer::Impl {
     int mouse_anchor = 0;
     int mouse_caret = 0;
     static constexpr float kEditPad = 2.0f;
+    // Inputs use DirectWrite in every text mode, sharing the list rendering
+    // parameters while EDIT continues to own text, undo and IME.
+    Microsoft::WRL::ComPtr<IDWriteFactory2> dw_factory;
+    Microsoft::WRL::ComPtr<IDWriteRenderingParams2> dw_params;
+    std::uint64_t dw_params_generation = 0;
+    HMONITOR dw_params_monitor = nullptr;
+    struct EditLayoutSlot {
+        std::wstring text;
+        Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+        std::uint64_t generation = 0;
+        float height = 0;
+        float font_size = 0;
+        DWRITE_READING_DIRECTION reading = DWRITE_READING_DIRECTION_LEFT_TO_RIGHT;
+        DWRITE_FLOW_DIRECTION flow = DWRITE_FLOW_DIRECTION_TOP_TO_BOTTOM;
+        DWRITE_LINE_SPACING_METHOD spacing_method = DWRITE_LINE_SPACING_METHOD_DEFAULT;
+        float line_spacing = 0;
+        float baseline = 0;
+        float tab_stop = 0;
+    };
+    std::array<EditLayoutSlot, 4> edit_layouts;
+    size_t next_edit_layout = 0;
     std::unordered_map<LayoutKey, LayoutSlot, LayoutKeyHash> layouts;
     std::list<LayoutKey> layout_lru;
     std::unordered_map<SurfaceKey, SurfaceEntry, SurfaceKeyHash> surfaces;
@@ -294,6 +317,8 @@ struct LumaTextRenderer::Impl {
     }
 
     void ClearLayouts() {
+        for (auto& entry : edit_layouts) entry = {};
+        next_edit_layout = 0;
         ClearSurfaces();
         layouts.clear();
         layout_lru.clear();
@@ -325,6 +350,8 @@ struct LumaTextRenderer::Impl {
         context_desc.dwrite_factory = dwrite;
         context_desc.cpu_cache_limit_bytes = kGlyphCacheLimit;
         if (lt_context_create(&context_desc, context.put()) != LT_OK) return false;
+        // Inputs fail back to native EDIT if their DirectWrite path is unavailable.
+        dwrite->QueryInterface(IID_PPV_ARGS(&dw_factory));
 
         if (FAILED(target->QueryInterface(IID_PPV_ARGS(&target_dc))) || !target_dc) {
             return false;
@@ -496,6 +523,9 @@ struct LumaTextRenderer::Impl {
     void Shutdown() noexcept {
         ClearLayouts();
         ReleasePresent();
+        dw_params.Reset();
+        dw_factory.Reset();
+        dw_params_monitor = nullptr;
         blit_target.Reset();
         blit_staging.Reset();
         blit_dc.Reset();
@@ -781,24 +811,6 @@ struct LumaTextRenderer::Impl {
         return true;
     }
 
-    LumaText::TextLayout* GetLeadingLayout(std::wstring_view text, IDWriteTextFormat* format) {
-        if (!format || text.empty()) return nullptr;
-        std::uint32_t family = 0;
-        LumaText::FontCascade* cascade = nullptr;
-        if (!ResolveCascade(format, text, family, cascade) || !cascade) return nullptr;
-        const float font_size = format->GetFontSize();
-        if (!(font_size > 0.0f)) return nullptr;
-        LayoutKey key;
-        key.text.assign(text);
-        key.family = family;
-        key.weight = static_cast<std::uint16_t>(std::clamp<int>(
-            static_cast<int>(format->GetFontWeight()), 1, 1000));
-        key.size_64 = static_cast<std::int32_t>(std::lround(font_size * 64.0f));
-        key.width_64 = kUnboundedWidth64;
-        key.alignment = DWRITE_TEXT_ALIGNMENT_LEADING;
-        return GetLayout(key, font_size, *cascade);
-    }
-
     static std::wstring ReadEditText(HWND hwnd) {
         const int len = GetWindowTextLengthW(hwnd);
         if (len <= 0) return {};
@@ -808,27 +820,91 @@ struct LumaTextRenderer::Impl {
         return text;
     }
 
-    float CaretOriginX(const lt_text_layout* layout, std::uint32_t position,
-                       std::uint32_t length) {
-        if (!layout || length == 0 || position == 0) return 0.0f;
-        auto hit = LumaText::Descriptor<lt_hit_test_metrics>();
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> DwEditLayout(std::wstring_view text,
+                                                           IDWriteTextFormat* format,
+                                                           float height) {
+        Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+        if (!dw_factory || !format || text.size() > UINT32_MAX) return layout;
+        const float line_height = std::max(1.0f, height);
+        const float font_size = format->GetFontSize();
+        const auto reading = format->GetReadingDirection();
+        const auto flow = format->GetFlowDirection();
+        DWRITE_LINE_SPACING_METHOD spacing_method = DWRITE_LINE_SPACING_METHOD_DEFAULT;
+        float line_spacing = 0, baseline = 0;
+        format->GetLineSpacing(&spacing_method, &line_spacing, &baseline);
+        const float tab_stop = format->GetIncrementalTabStop();
+        const auto generation = pulse::ui::typography::Generation();
+        // Caret blinking and drag selection reuse the same layout. Retaining
+        // the format prevents its address being recycled into a false hit.
+        const bool cacheable = text.size() <= 4096;
+        if (cacheable) {
+            for (const auto& entry : edit_layouts) {
+                if (entry.layout && entry.format.Get() == format && entry.generation == generation &&
+                    entry.height == line_height && entry.font_size == font_size && entry.reading == reading &&
+                    entry.flow == flow && entry.spacing_method == spacing_method &&
+                    entry.line_spacing == line_spacing && entry.baseline == baseline &&
+                    entry.tab_stop == tab_stop && entry.text == text) {
+                    ++stats.edit_layout_cache_hits;
+                    return entry.layout;
+                }
+            }
+        }
+        if (FAILED(dw_factory->CreateTextLayout(text.data(), static_cast<UINT32>(text.size()),
+                format, 1.0e6f, line_height, &layout)) || !layout) {
+            return nullptr;
+        }
+        // One unwrapped, untrimmed line; the edit scrolls it horizontally.
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        // Keep the unbounded line at the physical left origin even for RTL
+        // paragraphs; LEADING would place those glyphs near x = 1e6.
+        layout->SetTextAlignment(reading == DWRITE_READING_DIRECTION_RIGHT_TO_LEFT ?
+            DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_LEADING);
+        layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        const DWRITE_TRIMMING none{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
+        layout->SetTrimming(&none, nullptr);
+        ++stats.edit_layout_builds;
+        if (cacheable) {
+            auto& entry = edit_layouts[next_edit_layout];
+            next_edit_layout = (next_edit_layout + 1) % edit_layouts.size();
+            entry = {std::wstring(text), format, layout, generation, line_height, font_size, reading, flow,
+                spacing_method, line_spacing, baseline, tab_stop};
+        }
+        return layout;
+    }
+
+    static float DwCaretX(IDWriteTextLayout* layout, int position, int length) {
+        if (!layout || length <= 0) return 0.0f;
+        const bool trailing = position >= length;
+        const UINT32 probe = static_cast<UINT32>(trailing ? length - 1 : position);
         float x = 0.0f;
         float y = 0.0f;
-        const bool trailing = position >= length;
-        const std::uint32_t probe = trailing ? length : position;
-        if (lt_text_layout_hit_test_position(layout, probe, trailing, &x, &y, &hit) != LT_OK) {
+        DWRITE_HIT_TEST_METRICS hit{};
+        if (FAILED(layout->HitTestTextPosition(probe, trailing ? TRUE : FALSE, &x, &y, &hit)))
             return 0.0f;
-        }
         return x;
     }
 
-    int HitCharIndex(const lt_text_layout* layout, float x, int length) {
-        if (!layout || length <= 0 || x <= 0.0f) return 0;
-        auto hit = LumaText::Descriptor<lt_hit_test_metrics>();
-        if (lt_text_layout_hit_test_point(layout, x, 1.0f, &hit) != LT_OK) return length;
-        int index = static_cast<int>(hit.text_position);
-        if (hit.is_trailing) index += static_cast<int>(hit.text_length);
+    static int DwHitIndex(IDWriteTextLayout* layout, float x, int length) {
+        if (!layout || length <= 0) return 0;
+        BOOL trailing = FALSE;
+        BOOL inside = FALSE;
+        DWRITE_HIT_TEST_METRICS hit{};
+        if (FAILED(layout->HitTestPoint(x, 1.0f, &trailing, &inside, &hit))) return length;
+        const int index = static_cast<int>(hit.textPosition) +
+            (trailing ? static_cast<int>(hit.length) : 0);
         return std::clamp(index, 0, length);
+    }
+
+    IDWriteRenderingParams* DwParams(HWND hwnd) {
+        const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        const std::uint64_t generation = pulse::ui::typography::Generation();
+        if (!dw_params || dw_params_generation != generation || dw_params_monitor != monitor) {
+            dw_params.Reset();
+            pulse::ui::typography::CreateRenderingParams(dw_factory.Get(), monitor, &dw_params);
+            dw_params_generation = generation;
+            dw_params_monitor = monitor;
+        }
+        return dw_params.Get();
     }
 
     static float EditScrollX(float caret_x, float width) {
@@ -860,14 +936,13 @@ struct LumaTextRenderer::Impl {
         if (mouse_hwnd == hwnd) caret_for_scroll = mouse_caret;
         caret_for_scroll = std::clamp(caret_for_scroll, 0, static_cast<int>(text.size()));
 
-        LumaText::TextLayout* layout = GetLeadingLayout(text, format);
-        const lt_text_layout* native = (layout && *layout) ? layout->get() : nullptr;
-        const float caret_x = CaretOriginX(native,
-            static_cast<std::uint32_t>(caret_for_scroll),
-            static_cast<std::uint32_t>(text.size()));
+        const int length = static_cast<int>(text.size());
+        const auto dw = DwEditLayout(text, format, static_cast<float>(rc.bottom - rc.top));
+        if (!dw) return;
+        const float caret_x = DwCaretX(dw.Get(), caret_for_scroll, length);
         const float scroll = EditScrollX(caret_x, width);
-        const float layout_x = static_cast<float>(GET_X_LPARAM(lParam)) - kEditPad + scroll;
-        const int index = HitCharIndex(native, layout_x, static_cast<int>(text.size()));
+        const int index = DwHitIndex(dw.Get(), static_cast<float>(GET_X_LPARAM(lParam)) - kEditPad + scroll, length);
+        ++stats.edit_directwrite_hits;
 
         if (msg == WM_LBUTTONDBLCLK) {
             int start = index;
@@ -933,7 +1008,7 @@ struct LumaTextRenderer::Impl {
 
     bool PaintEdit(HWND hwnd, HDC hdc, IDWriteTextFormat* format,
                    const D2D1_COLOR_F& foreground, const D2D1_COLOR_F& background) {
-        if (!hwnd || !format || !blit_dc) return false;
+        if (!hwnd || !format || !blit_dc || !dw_factory) return false;
         RECT rc{};
         GetClientRect(hwnd, &rc);
         const int w = rc.right - rc.left;
@@ -960,15 +1035,13 @@ struct LumaTextRenderer::Impl {
             caret = mouse_caret;
         caret = std::clamp(caret, 0, static_cast<int>(text.size()));
 
-        LumaText::TextLayout* layout = GetLeadingLayout(text, format);
-        const lt_text_layout* native = (layout && *layout) ? layout->get() : nullptr;
+        const auto dw_layout = DwEditLayout(text, format, static_cast<float>(h));
+        IDWriteRenderingParams* params = DwParams(hwnd);
+        if (!dw_layout || !params) return false;
         const auto caret_origin = [&](int position) {
-            return CaretOriginX(native, static_cast<std::uint32_t>(std::max(0, position)),
-                                static_cast<std::uint32_t>(text.size()));
+            return DwCaretX(dw_layout.Get(), position, static_cast<int>(text.size()));
         };
         const float caret_x = caret_origin(caret);
-        const float sel_x0 = caret_origin(sel_lo);
-        const float sel_x1 = caret_origin(sel_hi);
         const float pad = kEditPad;
         const float scroll = EditScrollX(caret_x, static_cast<float>(w));
 
@@ -977,12 +1050,20 @@ struct LumaTextRenderer::Impl {
         blit_dc->Clear(background);
         Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
         blit_dc->CreateSolidColorBrush(background, &brush);
+        bool selection_drawn = sel_hi <= sel_lo || GetFocus() != hwnd;
         if (sel_hi > sel_lo && GetFocus() == hwnd && brush) {
             brush->SetColor(D2D1::ColorF(0.0f, 0.47f, 0.83f, 0.35f));
-            blit_dc->FillRectangle(
-                D2D1::RectF(pad + sel_x0 - scroll, 1.0f, pad + sel_x1 - scroll,
-                            static_cast<float>(h) - 1.0f),
-                brush.Get());
+            UINT32 count = 0;
+            dw_layout->HitTestTextRange(static_cast<UINT32>(sel_lo), static_cast<UINT32>(sel_hi - sel_lo),
+                pad - scroll, 0, nullptr, 0, &count);
+            std::vector<DWRITE_HIT_TEST_METRICS> ranges(count);
+            if (count && SUCCEEDED(dw_layout->HitTestTextRange(static_cast<UINT32>(sel_lo),
+                static_cast<UINT32>(sel_hi - sel_lo), pad - scroll, 0, ranges.data(), count, &count))) {
+                for (const auto& range : ranges)
+                    blit_dc->FillRectangle(D2D1::RectF(range.left, 1.0f,
+                        range.left + range.width, static_cast<float>(h) - 1.0f), brush.Get());
+                selection_drawn = true;
+            }
         }
         std::wstring visible = text;
         D2D1_COLOR_F visible_color = foreground;
@@ -995,14 +1076,27 @@ struct LumaTextRenderer::Impl {
                                              foreground.a * 0.45f);
             }
         }
+        bool text_drawn = visible.empty();
         if (!visible.empty()) {
-            float text_w = 0.0f;
-            Measure(visible, format, text_w, nullptr);
-            const float draw_w = std::max(static_cast<float>(w) + scroll, text_w + 8.0f);
-            const D2D1_RECT_F text_bounds{
-                pad - scroll, 0.0f, pad - scroll + draw_w, static_cast<float>(h)};
-            DrawOn(blit_dc.Get(), visible, format, text_bounds, visible_color, background,
-                   DWRITE_TEXT_ALIGNMENT_LEADING);
+            // Same layout, params and grayscale AA as the surrounding UI text.
+            const auto visible_layout = visible == text && dw_layout
+                ? dw_layout : DwEditLayout(visible, format, static_cast<float>(h));
+            if (visible_layout && brush) {
+                DWRITE_TEXT_METRICS metrics{};
+                if (FAILED(visible_layout->GetMetrics(&metrics))) {
+                    blit_dc->EndDraw();
+                    blit_dc->SetTarget(nullptr);
+                    return false;
+                }
+                const float y = std::round((static_cast<float>(h) - metrics.height) * 0.5f) - metrics.top;
+                brush->SetColor(visible_color);
+                blit_dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                blit_dc->SetTextRenderingParams(params);
+                blit_dc->DrawTextLayout(D2D1::Point2F(std::round(pad - scroll), y), visible_layout.Get(),
+                                        brush.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+                blit_dc->SetTextRenderingParams(nullptr);
+                text_drawn = true;
+            }
         }
         const UINT blink = GetCaretBlinkTime();
         const bool caret_on = GetFocus() == hwnd && GetCapture() != hwnd &&
@@ -1021,7 +1115,9 @@ struct LumaTextRenderer::Impl {
         }
         const HRESULT end = blit_dc->EndDraw();
         blit_dc->SetTarget(nullptr);
-        if (FAILED(end)) return false;
+        if (FAILED(end) || !text_drawn || !selection_drawn || !brush) return false;
+        ++stats.edit_directwrite_draws;
+        stats.edit_rendering_mode = params->GetRenderingMode();
         if (FAILED(blit_staging->CopyFromBitmap(nullptr, blit_target.Get(), nullptr))) {
             return false;
         }

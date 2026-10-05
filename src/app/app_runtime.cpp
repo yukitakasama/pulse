@@ -416,7 +416,57 @@ void FillPaneSlots(AppState& s, ui::WindowViewModel& vm) {
             vm.settings_global_search_error = s.settings.global_search_error();
             vm.settings_content_status = ContentIndexStatusText(s);
             vm.settings_expanded = s.settingsExpanded;
-            if (vm.settings_page == 0) vm.settings_preview_codecs = ui::DetectPreviewCodecs(false, s.hwnd);
+            if (vm.settings_page == 5) vm.settings_preview_codecs = ui::DetectPreviewCodecs(false, s.hwnd);
+            if (vm.settings_page == 5) {
+                // Cached in the controller: the disk is read at most every 2 s.
+                const auto& packs = s.settings.Packs();
+                vm.settings_pack_ffmpeg = packs.ffmpeg;
+                vm.settings_pack_media_available = packs.media_available;
+                vm.settings_pack_images_available = packs.images_available;
+                vm.settings_pack_media_installed = packs.media_installed;
+                vm.settings_pack_ffmpeg_enabled = packs.enabled;
+                vm.settings_pack_use_custom = packs.use_custom;
+                vm.settings_pack_remove_on_uninstall = packs.remove_on_uninstall;
+                vm.settings_pack_installed = packs.installed;
+                vm.settings_pack_bytes = packs.bytes;
+                vm.settings_pack_version = packs.version;
+                vm.settings_pack_custom_path = packs.custom_path;
+                vm.settings_pack_detected_path = packs.detected_path;
+                vm.settings_pack_root = packs.root;
+                vm.settings_pack_notice = packs.notice;
+                vm.settings_pack_installing = packs.installing;
+                vm.settings_pack_progress = packs.progress;
+                vm.settings_pack_images_installed = packs.images_installed;
+                vm.settings_pack_images_enabled = packs.images_enabled;
+                vm.settings_pack_images_version = packs.images_version;
+                vm.settings_pack_images_notice = packs.images_notice;
+                vm.settings_pack_images_installing = packs.images_installing;
+                vm.settings_pack_images_progress = packs.images_progress;
+                vm.settings_pack_raw_available = packs.raw_available;
+                vm.settings_pack_raw_installed = packs.raw_installed;
+                vm.settings_pack_raw_enabled = packs.raw_enabled;
+                vm.settings_pack_raw_version = packs.raw_version;
+                vm.settings_pack_raw_notice = packs.raw_notice;
+                vm.settings_pack_raw_installing = packs.raw_installing;
+                vm.settings_pack_raw_progress = packs.raw_progress;
+                vm.settings_pack_archive_available = packs.archive_available;
+                vm.settings_pack_archive_installed = packs.archive_installed;
+                vm.settings_pack_archive_enabled = packs.archive_enabled;
+                vm.settings_pack_archive_version = packs.archive_version;
+                vm.settings_pack_archive_notice = packs.archive_notice;
+                vm.settings_pack_archive_installing = packs.archive_installing;
+                vm.settings_pack_archive_progress = packs.archive_progress;
+                // Screenshot fixture for the downloading state (percent).
+                wchar_t fake_progress[8]{};
+                if (s.shot.active && s.isolatedTest &&
+                    GetEnvironmentVariableW(L"PULSE_TEST_PACK_PROGRESS", fake_progress, ARRAYSIZE(fake_progress))) {
+                    vm.settings_pack_installing = vm.settings_pack_images_installing =
+                        vm.settings_pack_raw_installing = vm.settings_pack_archive_installing = true;
+                    vm.settings_pack_progress = vm.settings_pack_images_progress =
+                        vm.settings_pack_raw_progress = vm.settings_pack_archive_progress =
+                        static_cast<float>(_wtoi(fake_progress)) / 100.0f;
+                }
+            }
             vm.settings_theme = s.themeOverride == ui::ThemeMode::Light ? 1 : s.themeOverride == ui::ThemeMode::Dark ? 2 : 0;
             const auto content_config = s.contentSearch.GetConfig();
             const auto content_status = s.contentSearch.GetStatus();
@@ -1765,6 +1815,40 @@ static void FillTrayCompare(AppState& s, const std::wstring (&paths)[2],
 
 ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     if (!s.pane) return {};
+    // A finished pack download repaints the window once; drop the cached
+    // failed thumbnails so the newly supported files are decoded again.
+    if (s.settings.TakeMediaPackResult()) {
+        s.renderer.EvictThumbnails();
+        s.quickPreview.OnMediaPackInstalled();
+    }
+    if (s.settings.TakeImagePackResult()) {
+        s.renderer.EvictThumbnails();
+        s.quickPreview.OnImagePackInstalled();
+    }
+    const bool raw_installed = s.settings.TakeRawPackResult();
+    const bool archive_installed = s.settings.TakeArchivePackResult();
+    if (raw_installed || archive_installed) {
+        s.renderer.EvictThumbnails();
+        s.quickPreview.OnExtraPackInstalled();
+    }
+    if (s.quickPreview.visible()) {
+        ui::MediaPackOffer offer, image_offer;
+        s.settings.FillMediaPackOffer(offer);
+        s.settings.FillImagePackOffer(image_offer);
+        // Fixture for the Quick Look offers while no pack is published.
+        wchar_t fake[8]{};
+        if (s.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_PACK_OFFER", fake, ARRAYSIZE(fake))) {
+            offer.installable = image_offer.installable = true;
+            if (!offer.download_bytes) offer.download_bytes = uint64_t{28} << 20;
+            if (!image_offer.download_bytes) image_offer.download_bytes = uint64_t{9} << 20;
+            if (GetEnvironmentVariableW(L"PULSE_TEST_PACK_PROGRESS", fake, ARRAYSIZE(fake))) {
+                offer.installing = image_offer.installing = true;
+                offer.progress = image_offer.progress = static_cast<float>(_wtoi(fake)) / 100.0f;
+            }
+        }
+        s.quickPreview.SetMediaPackOffer(offer);
+        s.quickPreview.SetImagePackOffer(image_offer);
+    }
     UpdateFolderCompare(s);
     s.changes.visible_paths.clear();
     ForEachPane(s, [&](app::Pane& pane) {
@@ -1785,6 +1869,7 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     vm.settings_list_size_bar = s.appPrefs.list_size_bar;
     vm.settings_list_tag_names = s.appPrefs.list_tag_name_color;
     vm.settings_list_selection_outline = s.appPrefs.list_selection_outline;
+    vm.settings_list_thumbnail_badges = s.appPrefs.list_thumbnail_badges;
     vm.settings_vertical_tabs = s.appPrefs.vertical_tabs;
     vm.settings_show_hints = s.appPrefs.show_hints;
     vm.settings_tips_seen = s.appPrefs.tips_seen != 0;
@@ -2373,6 +2458,7 @@ std::wstring TooltipForHover(AppState& s) {
     case R::SettingsButton: return text(I::Settings);
     case R::SettingsFind: return text(I::SettingsFind);
     case R::SettingsNav: {
+        if (s.hoverControlIndex == 5) return l10n::Pick(L"快速预览", L"Quick Look");
         const I names[]={I::SettingsGeneral,I::SettingsSearchIndex,I::SettingsContextMenu,I::SettingsAboutDiagnostics,I::SettingsDuplicates};
         return s.hoverControlIndex>=0 && s.hoverControlIndex<5 ? text(names[s.hoverControlIndex]) : L"";
     }

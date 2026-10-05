@@ -1,4 +1,5 @@
 #include "index_config.h"
+#include "../common/config_json.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
 #include <algorithm>
@@ -115,46 +116,6 @@ std::wstring Win32Error(const wchar_t* operation) {
         out += L"：";
         out += message;
         LocalFree(message);
-    }
-    return out;
-}
-
-std::vector<std::wstring> ExtractStringArray(const std::wstring& json,
-                                             const std::wstring& key) {
-    std::vector<std::wstring> out;
-    const std::wstring marker = L"\"" + key + L"\"";
-    size_t p = json.find(marker);
-    if (p == std::wstring::npos) return out;
-    p = json.find(L'[', p + marker.size());
-    if (p == std::wstring::npos) return out;
-    ++p;
-    while (p < json.size()) {
-        while (p < json.size() && iswspace(json[p])) ++p;
-        if (p >= json.size() || json[p] == L']') break;
-        if (json[p] != L'\"') return {};
-        ++p;
-        std::wstring value;
-        while (p < json.size() && json[p] != L'\"') {
-            if (json[p] != L'\\') {
-                value.push_back(json[p++]);
-                continue;
-            }
-            if (++p >= json.size()) return {};
-            switch (json[p]) {
-            case L'\"': value.push_back(L'\"'); break;
-            case L'\\': value.push_back(L'\\'); break;
-            case L'n': value.push_back(L'\n'); break;
-            case L'r': value.push_back(L'\r'); break;
-            case L't': value.push_back(L'\t'); break;
-            default: value.push_back(json[p]); break;
-            }
-            ++p;
-        }
-        if (p >= json.size()) return {};
-        ++p;
-        out.push_back(std::move(value));
-        while (p < json.size() && iswspace(json[p])) ++p;
-        if (p < json.size() && json[p] == L',') ++p;
     }
     return out;
 }
@@ -278,56 +239,72 @@ std::wstring MachineConfigPath() {
     return root.empty() ? L"" : root + L"\\index-config.json";
 }
 
+bool LoadIndexConfigFrom(const std::wstring& path, const std::wstring& default_index_path,
+                         IndexConfig& config, std::wstring* error) {
+    IndexConfig loaded;
+    loaded.index_path = default_index_path;
+    std::wstring json;
+    if (!pulse::ReadUtf8File(path, json)) {
+        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            const DWORD code = GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) {
+                config = std::move(loaded);
+                return true;
+            }
+        }
+        config.load_failed = true;
+        SetError(error, L"无法读取索引配置");
+        return false;
+    }
+    if (!pulse::json::ValidConfigObject(json)) {
+        config.load_failed = true;
+        SetError(error, L"索引配置为空或损坏");
+        return false;
+    }
+    loaded.version = static_cast<uint32_t>((std::max)(1, pulse::json::ExtractInt(json, L"version", 1)));
+    loaded.generation = static_cast<uint64_t>((std::max)(1, pulse::json::ExtractInt(json, L"generation", 1)));
+    loaded.include_fixed_ntfs = pulse::json::ExtractBool(json, L"include_fixed_ntfs", true);
+    loaded.include_removable_ntfs = pulse::json::ExtractBool(json, L"include_removable_ntfs", true);
+    loaded.index_path = pulse::json::ExtractString(json, L"index_path", default_index_path);
+    if (loaded.index_path.empty()) loaded.index_path = default_index_path;
+    for (auto& id : pulse::json::ExtractStringArray(json, L"excluded_volume_ids"))
+        loaded.excluded_volume_ids.insert(NormalizeVolumeId(std::move(id)));
+    for (auto& path_value : pulse::json::ExtractStringArray(json, L"excluded_paths")) {
+        std::replace(path_value.begin(), path_value.end(), L'/', L'\\');
+        while (path_value.size() > 3 && path_value.back() == L'\\') path_value.pop_back();
+        if (!path_value.empty()) loaded.excluded_paths.push_back(std::move(path_value));
+    }
+    std::sort(loaded.excluded_paths.begin(), loaded.excluded_paths.end(),
+              [](const auto& a, const auto& b) {
+                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+              });
+    loaded.excluded_paths.erase(std::unique(loaded.excluded_paths.begin(), loaded.excluded_paths.end(),
+              [](const auto& a, const auto& b) {
+                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+              }), loaded.excluded_paths.end());
+    config = std::move(loaded);
+    return true;
+}
+
 bool LoadMachineConfig(IndexConfig& config, std::wstring* error) {
-    config = {};
     const std::wstring root = MachineDataRoot();
-    config.index_path = root.empty() ? L"" : root + L"\\Index";
     std::wstring path = MachineConfigPath();
     if (path.empty()) {
+        config.load_failed = true;
         SetError(error, L"无法定位 ProgramData 索引目录");
         return false;
     }
     // Older releases kept machine configuration inside the default data directory.
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND)
         path = root + L"\\Index\\config.json";
-    std::wstring json;
-    if (!pulse::ReadUtf8File(path, json)) {
-        if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            const DWORD code = GetLastError();
-            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return true;
-        }
-        SetError(error, L"无法读取索引配置");
-        return false;
-    }
-    if (json.empty() || json.find(L'{') == std::wstring::npos) {
-        SetError(error, L"索引配置为空或损坏");
-        return false;
-    }
-    config.version = static_cast<uint32_t>((std::max)(1, pulse::json::ExtractInt(json, L"version", 1)));
-    config.generation = static_cast<uint64_t>((std::max)(1, pulse::json::ExtractInt(json, L"generation", 1)));
-    config.include_fixed_ntfs = pulse::json::ExtractBool(json, L"include_fixed_ntfs", true);
-    config.include_removable_ntfs = pulse::json::ExtractBool(json, L"include_removable_ntfs", true);
-    config.index_path = pulse::json::ExtractString(json, L"index_path", root + L"\\Index");
-    if (config.index_path.empty()) config.index_path = root + L"\\Index";
-    for (auto& id : ExtractStringArray(json, L"excluded_volume_ids"))
-        config.excluded_volume_ids.insert(NormalizeVolumeId(std::move(id)));
-    for (auto& path_value : ExtractStringArray(json, L"excluded_paths")) {
-        std::replace(path_value.begin(), path_value.end(), L'/', L'\\');
-        while (path_value.size() > 3 && path_value.back() == L'\\') path_value.pop_back();
-        if (!path_value.empty()) config.excluded_paths.push_back(std::move(path_value));
-    }
-    std::sort(config.excluded_paths.begin(), config.excluded_paths.end(),
-              [](const auto& a, const auto& b) {
-                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_LESS_THAN;
-              });
-    config.excluded_paths.erase(std::unique(config.excluded_paths.begin(), config.excluded_paths.end(),
-              [](const auto& a, const auto& b) {
-                  return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
-              }), config.excluded_paths.end());
-    return true;
+    return LoadIndexConfigFrom(path, root + L"\\Index", config, error);
 }
 
 bool SaveMachineConfig(const IndexConfig& config, std::wstring* error) {
+    if (config.load_failed) {
+        SetError(error, L"索引配置读取失败，禁止覆盖");
+        return false;
+    }
     const std::wstring path = MachineConfigPath();
     if (path.empty()) {
         SetError(error, L"无法定位 ProgramData 索引目录");

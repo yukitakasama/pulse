@@ -1,5 +1,6 @@
 // archive_listing.cpp — see archive_listing.h.
 #include "archive_listing.h"
+#include "udf_listing.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -16,18 +17,10 @@ namespace {
 
 // ---- common model ---------------------------------------------------------
 
-struct Entry {
-    std::wstring path;
-    uint64_t size = 0;
-    uint64_t packed = 0;
-    SYSTEMTIME time{};
-    bool has_time = false;
-    bool dir = false;
-    bool encrypted = false;
-};
+using Entry = ArchiveListingEntry;
 
 struct Listing {
-    const wchar_t* format = L"";
+    std::wstring format;
     std::vector<Entry> entries;
     uint64_t packed_total = 0;
     bool has_packed = false;
@@ -179,7 +172,7 @@ std::wstring Serialize(Listing& listing) {
     const bool complete = EmitRows(root, 0, listing.has_packed, rows_text, rows);
     if (!complete) listing.incomplete = true;
     wchar_t head[160]{};
-    swprintf_s(head, L"PULSEARC\t1\t%s\t%s\t%d\n", listing.format,
+    swprintf_s(head, L"PULSEARC\t1\t%s\t%s\t%d\n", listing.format.c_str(),
                listing.has_packed ? std::to_wstring(listing.packed_total).c_str() : L"-",
                listing.incomplete ? 1 : 0);
     return head + rows_text;
@@ -323,6 +316,11 @@ struct LibArchive {
     archive* (*read_new)() = nullptr;
     int (*support_filter_all)(archive*) = nullptr;
     int (*support_format_all)(archive*) = nullptr;
+    int (*support_format_raw)(archive*) = nullptr;
+    int (*format)(archive*) = nullptr;
+    const char* (*format_name)(archive*) = nullptr;
+    int (*filter_code)(archive*, int) = nullptr;
+    intptr_t (*read_data)(archive*, void*, size_t) = nullptr;
     int (*open_filename_w)(archive*, const wchar_t*, size_t) = nullptr;
     int (*next_header)(archive*, archive_entry**) = nullptr;
     int (*data_skip)(archive*) = nullptr;
@@ -343,6 +341,11 @@ struct LibArchive {
             fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(GetProcAddress(module, name));
             return fn != nullptr;
         };
+        load(support_format_raw, "archive_read_support_format_raw");
+        load(format, "archive_format");
+        load(format_name, "archive_format_name");
+        load(filter_code, "archive_filter_code");
+        load(read_data, "archive_read_data");
         ready = load(read_new, "archive_read_new") &&
             load(support_filter_all, "archive_read_support_filter_all") &&
             load(support_format_all, "archive_read_support_format_all") &&
@@ -366,14 +369,14 @@ const wchar_t* FormatLabel(std::wstring_view ext) {
     if (ext == L".tar") return L"TAR";
     if (ext == L".cab") return L"CAB";
     if (ext == L".iso") return L"ISO";
-    if (ext == L".tgz" || ext == L".gz") return L"TAR.GZ";
-    if (ext == L".txz" || ext == L".xz") return L"TAR.XZ";
-    if (ext == L".tbz2" || ext == L".bz2") return L"TAR.BZ2";
+    if (ext == L".tgz" || ext == L".gz") return L"GZIP";
+    if (ext == L".txz" || ext == L".xz") return L"XZ";
+    if (ext == L".tbz2" || ext == L".bz2") return L"BZIP2";
     return L"Archive";
 }
 
 bool ListWithLibarchive(const std::wstring& path, std::wstring_view ext, uint64_t file_size,
-                        Listing& listing, uint32_t& bytes_read, std::wstring* error) {
+                        Listing& listing, uint32_t& bytes_read, std::wstring* error, bool compressed) {
     static LibArchive lib;
     if (!lib.ready) {
         if (error) *error = L"libarchive-unavailable";
@@ -385,6 +388,9 @@ bool ListWithLibarchive(const std::wstring& path, std::wstring_view ext, uint64_
     struct Owner { LibArchive& lib; archive* a; ~Owner() { lib.read_free(a); } } owner{lib, a};
     lib.support_filter_all(a);
     lib.support_format_all(a);
+    // Raw is a last-resort bidder and must never turn arbitrary input into an archive.
+    if (compressed && lib.support_format_raw && lib.format && lib.filter_code && lib.read_data)
+        lib.support_format_raw(a);
     if (lib.open_filename_w(a, path.c_str(), 64 * 1024) != 0) {
         if (error) *error = L"archive-open-failed";
         return false;
@@ -398,14 +404,31 @@ bool ListWithLibarchive(const std::wstring& path, std::wstring_view ext, uint64_
         if (r == 1) break;                       // ARCHIVE_EOF
         if (r < -20 || !entry) { failed = true; break; }  // FAILED / FATAL
         ++seen;
+        const int format = lib.format ? (lib.format(a) & 0xff0000) : 0;
+        const int filter = lib.filter_code ? lib.filter_code(a, 0) : 0;
+        const wchar_t* compression = filter == 1 ? L"GZIP" : filter == 2 ? L"BZIP2" : filter == 6 ? L"XZ" : L"";
+        const char* format_name = lib.format_name ? lib.format_name(a) : nullptr;
+        if (format_name && (std::strstr(format_name, "UDF") || std::strstr(format_name, "udf"))) listing.format = L"UDF";
+        else if (format == 0x30000) {
+            listing.format = L"TAR";
+            if (*compression) listing.format += filter == 1 ? L".GZ" : filter == 2 ? L".BZ2" : L".XZ";
+        } else if (format == 0x40000) listing.format = L"ISO";
+        else if (format == 0x90000) {
+            if (!compressed || !*compression) {
+                if (error) *error = L"compressed-stream-preview-unavailable";
+                return false;
+            }
+            listing.format = compression;
+        }
         if (listing.entries.size() < kMaxEntries) {
             Entry item;
             if (const wchar_t* w = lib.pathname_w(entry)) item.path = w;
             else if (const char* u = lib.pathname_utf8(entry)) {
                 const int n = MultiByteToWideChar(CP_UTF8, 0, u, -1, nullptr, 0);
                 if (n > 1) {
-                    item.path.resize(static_cast<size_t>(n - 1));
+                    item.path.resize(static_cast<size_t>(n));
                     MultiByteToWideChar(CP_UTF8, 0, u, -1, item.path.data(), n);
+                    item.path.resize(static_cast<size_t>(n - 1));
                 }
             }
             item.dir = (lib.filetype(entry) & 0170000) == 0040000;
@@ -418,6 +441,28 @@ bool ListWithLibarchive(const std::wstring& path, std::wstring_view ext, uint64_
                 FILETIME utc{t.LowPart, t.HighPart}, local{};
                 if (FileTimeToLocalFileTime(&utc, &local) && FileTimeToSystemTime(&local, &item.time))
                     item.has_time = true;
+            }
+            if (format == 0x90000) {
+                const size_t slash = path.find_last_of(L"\\/");
+                item.path = path.substr(slash == std::wstring::npos ? 0 : slash + 1);
+                const size_t dot = item.path.find_last_of(L'.');
+                if (dot != std::wstring::npos) item.path.resize(dot);
+                if (item.path.empty()) item.path = L"data";
+                item.size = 0;
+                char buffer[64 * 1024];
+                for (;;) {
+                    const intptr_t got = lib.read_data(a, buffer, sizeof(buffer));
+                    if (got < 0) {
+                        if (error) *error = L"compressed-stream-read-failed";
+                        return false;
+                    }
+                    if (!got) break;
+                    item.size += static_cast<uint64_t>(got);
+                    if (item.size > 64ull * 1024 * 1024 || GetTickCount64() - started > kLibarchiveBudgetMs) {
+                        if (error) *error = L"compressed-stream-preview-limit";
+                        return false;
+                    }
+                }
             }
             listing.entries.push_back(std::move(item));
         } else {
@@ -453,6 +498,7 @@ std::wstring LowerExtension(const std::wstring& path) {
 bool MakeArchiveListing(const std::wstring& path, std::wstring& text,
                         uint32_t& bytes_read, std::wstring* error) {
     text.clear();
+    if (error) error->clear();
     bytes_read = 0;
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
@@ -478,18 +524,83 @@ bool MakeArchiveListing(const std::wstring& path, std::wstring& text,
                    !(magic[0] == 'R' && magic[1] == 'a' && magic[2] == 'r')))) {
         ok = ListZip(file, static_cast<uint64_t>(size.QuadPart), listing, bytes_read);
     }
+    // UDF's volume recognition sequence uses NSR02/NSR03 identifiers.
+    bool udf = false;
+    bool iso9660 = false;
+    if (sized && ext == L".iso") {
+        unsigned char descriptor[7]{};
+        for (uint64_t sector = 16; sector < 256 && sector * 2048 + sizeof(descriptor) <= static_cast<uint64_t>(size.QuadPart); ++sector) {
+            if (!ReadAt(file, sector * 2048, descriptor, sizeof(descriptor))) break;
+            if (descriptor[0] == 1 && descriptor[6] == 1 && std::memcmp(descriptor + 1, "CD001", 5) == 0)
+                iso9660 = true;
+            if (descriptor[0] == 0 && descriptor[6] == 1 &&
+                (std::memcmp(descriptor + 1, "NSR02", 5) == 0 || std::memcmp(descriptor + 1, "NSR03", 5) == 0)) {
+                udf = true;
+            }
+        }
+    }
+    const bool compressed = sniffed && ((magic[0] == 0x1f && magic[1] == 0x8b) ||
+        (magic[0] == 'B' && magic[1] == 'Z' && magic[2] == 'h') ||
+        (got >= 6 && std::memcmp(magic, "\xfd" "7zXZ\0", 6) == 0));
+    std::wstring udf_reason;
+    if (udf) {
+        UdfListing native;
+        if (ReadUdfListing(file, static_cast<uint64_t>(size.QuadPart), native)) {
+            listing = Listing{};
+            listing.format = L"UDF";
+            listing.incomplete = native.incomplete;
+            for (auto& item : native.entries) {
+                Entry entry;
+                entry.path = std::move(item.path); entry.size = item.size;
+                entry.dir = item.directory; entry.time = item.time; entry.has_time = item.has_time;
+                listing.entries.push_back(std::move(entry));
+            }
+            bytes_read = static_cast<uint32_t>((std::min)(native.bytes_read, uint64_t{UINT32_MAX}));
+            if (error) *error = native.reason;
+            CloseHandle(file);
+            text = Serialize(listing);
+            return true;
+        }
+        udf_reason = native.reason.empty() ? L"udf-invalid" : native.reason;
+    }
     CloseHandle(file);
+    if (udf_reason == L"udf-cancelled" || udf_reason == L"udf-limit") {
+        if (error) *error = udf_reason;
+        return false;
+    }
     if (!ok && sized) {
         listing = Listing{};
         const bool other_magic = sniffed && ((magic[0] == '7' && magic[1] == 'z') ||
             (magic[0] == 'R' && magic[1] == 'a' && magic[2] == 'r'));
         ok = ListWithLibarchive(path, other_magic && ext == L".zip"
                 ? std::wstring_view(magic[0] == '7' ? L".7z" : L".rar") : std::wstring_view(ext),
-            static_cast<uint64_t>(size.QuadPart), listing, bytes_read, error);
+            static_cast<uint64_t>(size.QuadPart), listing, bytes_read, error, compressed);
     }
-    if (!ok) return false;
+    // A UDF-only image starts with zero-filled sectors, which the tar reader
+    // may accept as an empty archive. Do not present that as an ISO directory.
+    if (udf && !iso9660 && listing.format != L"UDF") ok = false;
+    if (!ok) {
+        if (udf && error) *error = udf_reason.empty() ? L"udf-preview-unavailable" : udf_reason;
+        else if (compressed && error && (*error == L"archive-open-failed" || *error == L"archive-read-failed" || *error == L"libarchive-unavailable"))
+            *error = L"compressed-stream-preview-unavailable";
+        return false;
+    }
+    if (udf && listing.format == L"ISO") {
+        listing.format = L"ISO/UDF";
+        listing.incomplete = true;
+        if (error) *error = udf_reason;
+    }
     text = Serialize(listing);
     return true;
+}
+
+std::wstring SerializeArchiveEntries(std::vector<ArchiveListingEntry> entries,
+    const std::wstring& format, bool incomplete) {
+    Listing listing;
+    listing.entries = std::move(entries);
+    listing.format = format;
+    listing.incomplete = incomplete;
+    return Serialize(listing);
 }
 
 } // namespace pulse::preview

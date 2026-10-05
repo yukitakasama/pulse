@@ -14,11 +14,15 @@
 #include <dxgi.h>
 #include <objbase.h>
 #include <wrl/client.h>
+#include <xmllite.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <utility>
+#include <string_view>
+#include <cwctype>
+#include <cstdint>
 
 using Microsoft::WRL::ComPtr;
 
@@ -151,13 +155,15 @@ bool EnsureStack() {
     return true;
 }
 
-bool ReadWholeFile(const std::wstring& path, std::vector<unsigned char>& bytes) {
+bool ReadWholeFile(const std::wstring& path, std::vector<unsigned char>& bytes, bool& limited) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
-    bool ok = GetFileSizeEx(file, &size) != 0 && size.QuadPart > 0 &&
+    const bool sized = GetFileSizeEx(file, &size) != 0;
+    limited = sized && size.QuadPart > 0 && static_cast<uint64_t>(size.QuadPart) > kMaxSvgBytes;
+    bool ok = sized && size.QuadPart > 0 &&
         static_cast<uint64_t>(size.QuadPart) <= kMaxSvgBytes;
     if (ok) {
         bytes.resize(static_cast<size_t>(size.QuadPart));
@@ -220,6 +226,98 @@ bool IntrinsicSize(ID2D1SvgDocument* document, float& width, float& height) {
 
 } // namespace
 
+bool IsSvgSupportedForDirect2D(const std::vector<unsigned char>& bytes, std::wstring& error) {
+    using CreateReader = HRESULT(WINAPI*)(REFIID, void**, IMalloc*);
+    static const HMODULE module = LoadLibraryExW(L"xmllite.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static const auto create_reader = module ? reinterpret_cast<CreateReader>(GetProcAddress(module, "CreateXmlReader")) : nullptr;
+    const auto fail = [&error](std::wstring reason) { error = std::move(reason); return false; };
+    if (bytes.size() > kMaxSvgBytes) return fail(L"svg-budget-exceeded");
+    if (!create_reader) return fail(L"svg-validation-unavailable");
+    ComPtr<IStream> stream;
+    ComPtr<IXmlReader> reader;
+    if (!MakeStream(bytes, stream) || FAILED(create_reader(__uuidof(IXmlReader), reinterpret_cast<void**>(reader.GetAddressOf()), nullptr)) ||
+        FAILED(reader->SetProperty(XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit)) || FAILED(reader->SetInput(stream.Get())))
+        return fail(L"svg-parse-failed");
+    const auto contains = [](std::wstring_view list, std::wstring_view word) {
+        return (L"|" + std::wstring(list) + L"|").find(L"|" + std::wstring(word) + L"|") != std::wstring::npos;
+    };
+    const auto unsafe_value = [](std::wstring_view value) {
+        if (value.find(L"var(") != std::wstring_view::npos || value.find(L"calc(") != std::wstring_view::npos) return true;
+        size_t start = 0;
+        while ((start = value.find(L"url(", start)) != std::wstring_view::npos) {
+            if (value.substr(start, 5) != L"url(#") return true;
+            start += 5;
+        }
+        for (size_t i = 1; i + 1 < value.size(); ++i)
+            if (value[i] == L'e' && (value[i + 1] == L'm' || value[i + 1] == L'x') &&
+                (iswdigit(value[i - 1]) || value[i - 1] == L'.')) return true;
+        return false;
+    };
+    constexpr std::wstring_view presentation = L"clip-path|clip-rule|color|display|fill|fill-opacity|fill-rule|opacity|overflow|stop-color|stop-opacity|stroke|stroke-dasharray|stroke-dashoffset|stroke-linecap|stroke-linejoin|stroke-miterlimit|stroke-opacity|stroke-width|visibility";
+    XmlNodeType type{};
+    HRESULT hr = S_OK;
+    bool root = false;
+    uint32_t nodes = 0;
+    while ((hr = reader->Read(&type)) == S_OK) {
+        UINT depth = 0;
+        if (++nodes > 50000 || FAILED(reader->GetDepth(&depth)) || depth > 128) return fail(L"svg-budget-exceeded");
+        if (type == XmlNodeType_ProcessingInstruction) return fail(L"svg-unsupported:processing-instruction");
+        if (type != XmlNodeType_Element) continue;
+        const wchar_t* name = nullptr;
+        const wchar_t* uri = nullptr;
+        if (FAILED(reader->GetLocalName(&name, nullptr)) || FAILED(reader->GetNamespaceUri(&uri, nullptr))) return fail(L"svg-parse-failed");
+        const std::wstring element(name ? name : L"");
+        if ((!root && element != L"svg") || (uri && *uri && std::wstring_view(uri) != L"http://www.w3.org/2000/svg"))
+            return fail(L"svg-unsupported:namespace");
+        root = true;
+        // Direct2D ignores unsupported markup, so validate before giving it a document.
+        // https://learn.microsoft.com/windows/win32/direct2d/svg-support
+        if (!contains(L"circle|clipPath|defs|desc|ellipse|g|image|line|linearGradient|path|polygon|polyline|radialGradient|rect|stop|svg|title|use", element))
+            return fail(L"svg-unsupported:element:" + element);
+        if (reader->MoveToFirstAttribute() != S_OK) continue;
+        do {
+            const wchar_t* attr = nullptr;
+            const wchar_t* prefix = nullptr;
+            const wchar_t* raw = nullptr;
+            const wchar_t* attr_uri = nullptr;
+            reader->GetLocalName(&attr, nullptr); reader->GetPrefix(&prefix, nullptr);
+            reader->GetValue(&raw, nullptr); reader->GetNamespaceUri(&attr_uri, nullptr);
+            const std::wstring_view key(attr ? attr : L""), value(raw ? raw : L"");
+            if (key == L"xmlns" || (prefix && std::wstring_view(prefix) == L"xmlns")) continue;
+            if (attr_uri && *attr_uri && !(key == L"href" && std::wstring_view(attr_uri) == L"http://www.w3.org/1999/xlink"))
+                return fail(L"svg-unsupported:attribute-namespace");
+            if (key == L"id" || (element == L"svg" && key == L"version")) continue;
+            if (contains(presentation, key)) {
+                if (unsafe_value(value)) return fail(L"svg-unsupported:attribute:" + std::wstring(key));
+                continue;
+            }
+            bool supported = key == L"transform" && contains(L"circle|clipPath|defs|ellipse|g|image|line|path|polygon|polyline|rect|use", element);
+            if (element == L"circle") supported |= contains(L"cx|cy|r", key);
+            if (element == L"ellipse") supported |= contains(L"cx|cy|rx|ry", key);
+            if (element == L"rect") supported |= contains(L"x|y|width|height|rx|ry", key);
+            if (element == L"svg" || element == L"image") supported |= contains(L"x|y|width|height|preserveAspectRatio", key);
+            if (element == L"svg") supported |= key == L"viewBox";
+            if (element == L"line") supported |= contains(L"x1|y1|x2|y2", key);
+            if (element == L"path") supported |= key == L"d";
+            if (element == L"polygon" || element == L"polyline") supported |= key == L"points";
+            if (element == L"clipPath") supported |= key == L"clipPathUnits";
+            if (element == L"stop") supported |= key == L"offset";
+            if (element == L"use") supported |= contains(L"x|y|width|height", key);
+            if (element == L"linearGradient") supported |= contains(L"x1|y1|x2|y2|gradientUnits|gradientTransform|spreadMethod", key);
+            if (element == L"radialGradient") supported |= contains(L"cx|cy|r|fx|fy|gradientUnits|gradientTransform|spreadMethod", key);
+            if (key == L"href" && attr_uri && std::wstring_view(attr_uri) == L"http://www.w3.org/1999/xlink") {
+                if (element == L"image") supported = value.starts_with(L"data:image/png;base64,") || value.starts_with(L"data:image/jpeg;base64,");
+                else if (contains(L"use|linearGradient|radialGradient", element)) supported = value.starts_with(L"#");
+            }
+            if (!supported || (key != L"href" && unsafe_value(value))) return fail(L"svg-unsupported:attribute:" + std::wstring(key));
+        } while (reader->MoveToNextAttribute() == S_OK);
+        reader->MoveToElement();
+    }
+    if (FAILED(hr) || !root) return fail(L"svg-parse-failed");
+    error.clear();
+    return true;
+}
+
 bool RasterizeSvgFile(const std::wstring& path, UINT max_edge,
                       std::vector<unsigned char>& pixels,
                       UINT& width, UINT& height, UINT& stride,
@@ -230,10 +328,17 @@ bool RasterizeSvgFile(const std::wstring& path, UINT max_edge,
         return false;
     };
     pixels.clear();
+    width = height = stride = source_width = source_height = 0;
     if (max_edge == 0) max_edge = static_cast<UINT>(kProbeEdge);
 
     std::vector<unsigned char> bytes;
-    if (!ReadWholeFile(path, bytes)) return fail(L"svg-unreadable");
+    bool limited = false;
+    if (!ReadWholeFile(path, bytes, limited)) return fail(limited ? L"svg-budget-exceeded" : L"svg-unreadable");
+    std::wstring validation_error;
+    if (!IsSvgSupportedForDirect2D(bytes, validation_error)) {
+        if (error) *error = std::move(validation_error);
+        return false;
+    }
 
     ComPtr<IStream> stream;
     if (!MakeStream(bytes, stream)) return fail(L"svg-stream-failed");
@@ -311,6 +416,7 @@ bool RasterizeSvgFile(const std::wstring& path, UINT max_edge,
     height = out_height;
     source_width = (std::max)(1u, static_cast<UINT>(document_width + 0.5f));
     source_height = (std::max)(1u, static_cast<UINT>(document_height + 0.5f));
+    if (error) error->clear();
     return true;
 }
 

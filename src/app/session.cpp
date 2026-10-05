@@ -1,5 +1,6 @@
 // session.cpp
 #include "session.h"
+#include "../common/config_json.h"
 #include "../ui/panel_metrics.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
@@ -186,60 +187,21 @@ std::wstring TabGroupsToJson(const std::vector<GroupSessionSnapshot>& groups) {
 }
 
 // Extract the contents of each top-level {...} object inside an array body
-// (without the outer brackets). Handles nested objects/arrays and string
-// escapes; returns false on unbalanced input.
+// (without the outer brackets); returns false on unbalanced input.
 static bool SplitTopLevelObjects(const std::wstring& body,
                                  std::vector<std::wstring>& out) {
-    int depth = 0;
-    bool inStr = false;
-    size_t start = std::wstring::npos;
-    for (size_t i = 0; i < body.size(); ++i) {
-        wchar_t c = body[i];
-        if (inStr) {
-            if (c == L'\\') ++i;
-            else if (c == L'"') inStr = false;
-            continue;
-        }
-        if (c == L'"') inStr = true;
-        else if (c == L'{' || c == L'[') {
-            if (depth == 0 && c == L'{') start = i;
-            ++depth;
-        } else if (c == L'}' || c == L']') {
-            --depth;
-            if (depth < 0) return false;
-            if (depth == 0 && start != std::wstring::npos && c == L'}') {
-                out.push_back(body.substr(start, i - start + 1));
-                start = std::wstring::npos;
-            }
-        }
-    }
-    return depth == 0 && !inStr;
+    return pulse::json::ForEachElement(L"[" + body + L"]", [&](const std::wstring& element) {
+        if (!element.empty() && element.front() == L'{') out.push_back(element);
+    });
 }
 
+// The body (without brackets) of key's array value.
 static bool ExtractJsonArray(const std::wstring& json, const wchar_t* key,
                              std::wstring& body) {
-    size_t pos = pulse::json::ValuePosition(json, key);
-    if (pos == std::wstring::npos || pos >= json.size() || json[pos] != L'[')
-        return false;
-    int depth = 0;
-    bool inStr = false;
-    for (size_t i = pos; i < json.size(); ++i) {
-        wchar_t c = json[i];
-        if (inStr) {
-            if (c == L'\\') ++i;
-            else if (c == L'"') inStr = false;
-            continue;
-        }
-        if (c == L'"') inStr = true;
-        else if (c == L'[') ++depth;
-        else if (c == L']') {
-            if (--depth == 0) {
-                body = json.substr(pos + 1, i - pos - 1);
-                return true;
-            }
-        }
-    }
-    return false;
+    const std::wstring array = pulse::json::ExtractArray(json, key);
+    if (array.size() < 2) return false;
+    body = array.substr(1, array.size() - 2);
+    return true;
 }
 
 bool ParseTabGroups(const std::wstring& array_json,
@@ -385,7 +347,11 @@ bool LoadSession(SessionSnapshot& snap) {
     if (dir.empty()) return false;
     std::wstring json;
     if (!ReadUtf8File(dir + L"\\session.json", json) || json.empty()) return false;
+    return ParseSessionJson(json, snap);
+}
 
+bool ParseSessionJson(const std::wstring& json, SessionSnapshot& snap) {
+    if (!pulse::json::ValidConfigObject(json)) return false;
     snap.window_rect.left = pulse::json::ExtractInt(json, L"left");
     snap.window_rect.top = pulse::json::ExtractInt(json, L"top");
     snap.window_rect.right = pulse::json::ExtractInt(json, L"right");
@@ -456,39 +422,11 @@ bool LoadSession(SessionSnapshot& snap) {
                 static_cast<float>(columnEdges[i]) / 10000.0f;
     }
 
-    size_t trayPos = json.find(L"\"tray\"");
-    if (trayPos != std::wstring::npos) {
-        size_t start = json.find(L'[', trayPos);
-        size_t end = json.find(L']', start);
-        if (start != std::wstring::npos && end != std::wstring::npos && end > start) {
-            std::wstring trayJson = json.substr(start, end - start + 1);
-            snap.tray.FromJson(trayJson);
-        }
-    }
-
-    size_t undoPos = json.find(L"\"undo\"");
-    if (undoPos != std::wstring::npos) {
-        size_t start = json.find(L'[', undoPos);
-        // Find the matching closing bracket (array may nest one level of "src":[...]).
-        if (start != std::wstring::npos) {
-            int depth = 0;
-            size_t end = std::wstring::npos;
-            bool inStr = false;
-            for (size_t i = start; i < json.size(); ++i) {
-                wchar_t c = json[i];
-                if (inStr) {
-                    if (c == L'\\') ++i;
-                    else if (c == L'"') inStr = false;
-                    continue;
-                }
-                if (c == L'"') inStr = true;
-                else if (c == L'[') ++depth;
-                else if (c == L']') { if (--depth == 0) { end = i; break; } }
-            }
-            if (end != std::wstring::npos)
-                snap.undo_json = json.substr(start, end - start + 1);
-        }
-    }
+    // Both hold nested arrays (each tray batch has its own "items" list).
+    if (const std::wstring tray = pulse::json::ExtractArray(json, L"tray"); !tray.empty())
+        snap.tray.FromJson(tray);
+    if (std::wstring undo = pulse::json::ExtractArray(json, L"undo"); !undo.empty())
+        snap.undo_json = std::move(undo);
 
     snap.active_layout_tab = pulse::json::ExtractInt(json, L"activeTab");
     snap.tab_groups.clear();

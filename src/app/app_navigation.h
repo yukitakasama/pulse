@@ -29,7 +29,7 @@ void AcceptIndexProviderResult(AppState& s, uint32_t id,
                                       index::SearchResult&& result, bool network,
                                       bool network_final = true);
 void AcceptLiveNetworkProgress(AppState& s, const std::shared_ptr<LiveNetworkSearch>& live);
-void DropLiveNetworkSearch(AppState& s);
+void DropLiveNetworkSearch(AppState& s, uint64_t session_id);
 void AddLiveNetworkRoot(AppState& s, app::Tab& tab);
 void MaybePrefetchSearchPage(AppState& s);
 void CancelActiveContentSearch(AppState& s, app::Tab& tab);

@@ -24,7 +24,6 @@ constexpr size_t kMaxRows = 5000;
 constexpr size_t kMaxColumns = 256;
 constexpr size_t kMaxCellChars = 2000;
 constexpr size_t kMaxSourceChars = 64u * 1024u;
-constexpr size_t kMaxSheets = 16;
 constexpr size_t kMaxXlsxEntryBytes = 48u * 1024u * 1024u;
 constexpr ULONGLONG kXlsxBudgetMs = 2500;
 
@@ -730,11 +729,15 @@ bool MakeCsvTable(const std::wstring& path, std::wstring_view extension, std::ws
     return true;
 }
 
-bool MakeXlsxTable(const std::wstring& path, std::wstring& payload, uint32_t& bytes_read) {
+bool MakeXlsxTable(const std::wstring& path, std::wstring& payload, uint32_t& bytes_read,
+                   uint32_t sheet_index) {
+    payload.clear();
+    bytes_read = 0;
     const ULONGLONG started = GetTickCount64();
     uint64_t total = 0;
     std::string workbook, rels, shared_xml, styles_xml;
-    if (!ReadPart(path, "xl/workbook.xml", workbook, nullptr, total)) return false;
+    bool workbook_cut = false;
+    if (!ReadPart(path, "xl/workbook.xml", workbook, &workbook_cut, total) || workbook_cut) return false;
     ReadPart(path, "xl/_rels/workbook.xml.rels", rels, nullptr, total);
     // Sheet order and names from workbook.xml, targets from its relationships.
     std::map<std::string, std::string> targets;
@@ -744,38 +747,63 @@ bool MakeXlsxTable(const std::wstring& path, std::wstring& payload, uint32_t& by
             if (k == XmlReader::Kind::Open && x.name() == "Relationship")
                 targets[std::string(x.Attr("Id"))] = ResolveTarget(std::string(x.Attr("Target")));
     }
-    struct SheetRef { std::wstring name; std::string part; };
+    struct SheetRef { std::wstring name; std::string part; bool hidden; };
     std::vector<SheetRef> sheets;
+    size_t total_sheets = 0, metadata_chars = 0;
+    bool metadata_full = false;
     {
         XmlReader x(workbook);
         for (auto k = x.Next(); k != XmlReader::Kind::End; k = x.Next()) {
             if (k != XmlReader::Kind::Open || x.name() != "sheet") continue;
             const auto state = x.Attr("state");
-            if (state == "hidden" || state == "veryHidden") continue;
+            ++total_sheets;
             const auto rel = targets.find(std::string(x.Attr("id")));
-            if (rel == targets.end()) continue;
-            sheets.push_back({XmlReader::Unescape(XmlReader::Utf8(x.Attr("name"))), rel->second});
-            if (sheets.size() >= kMaxSheets) break;
+            auto name = XmlReader::Unescape(XmlReader::Utf8(x.Attr("name"))).substr(0, 256);
+            // Reserve metadata before cell data so content cannot displace later tabs.
+            const size_t reserve = name.size() * 2 + 512;
+            if (metadata_full || metadata_chars + reserve > ipc::kPreviewMaxTableChars / 2) {
+                metadata_full = true;
+                continue;
+            }
+            metadata_chars += reserve;
+            sheets.push_back({std::move(name), rel == targets.end() ? std::string() : rel->second,
+                              state == "hidden" || state == "veryHidden"});
         }
     }
-    if (sheets.empty()) return false;
-    const auto shared = ReadPart(path, "xl/sharedStrings.xml", shared_xml, nullptr, total)
-        ? ReadSharedStrings(shared_xml) : std::vector<std::wstring>{};
-    const Styles styles = ReadPart(path, "xl/styles.xml", styles_xml, nullptr, total)
-        ? ReadStyles(styles_xml) : Styles{};
+    if (sheet_index >= sheets.size()) return false;
+    std::vector<std::wstring> shared;
+    Styles styles;
+    if (!sheets[sheet_index].hidden && !sheets[sheet_index].part.empty()) {
+        if (ReadPart(path, "xl/sharedStrings.xml", shared_xml, nullptr, total)) shared = ReadSharedStrings(shared_xml);
+        if (ReadPart(path, "xl/styles.xml", styles_xml, nullptr, total)) styles = ReadStyles(styles_xml);
+    }
     payload = L"PULSETBL\t1\n";
-    for (const SheetRef& sheet : sheets) {
+    size_t loaded = 0;
+    for (size_t index = 0; index < sheets.size(); ++index) {
+        const SheetRef& sheet = sheets[index];
         std::vector<Row> rows;
         size_t columns = 0;
         bool truncated = false, cut = false;
         std::string xml;
-        // Past the time budget the remaining sheets are listed empty (tabs stay).
-        const bool read = GetTickCount64() - started < kXlsxBudgetMs &&
-                          ReadPart(path, sheet.part, xml, &cut, total);
-        if (read) ReadSheet(xml, shared, styles, rows, columns, truncated);
-        AppendSheet(payload, L"xlsx", sheet.name, rows, columns, truncated || cut || !read, L"", false,
-                    ipc::kPreviewMaxTableChars - 64);
+        std::wstring reason;
+        bool read = false;
+        if (sheet.hidden) reason = L"hidden";
+        else if (sheet.part.empty()) reason = L"missing-relationship";
+        else if (index != sheet_index) reason = L"not-loaded";
+        else if (GetTickCount64() - started >= kXlsxBudgetMs) reason = L"time-limit";
+        else if (payload.size() + metadata_chars + 512 >= ipc::kPreviewMaxTableChars) reason = L"payload-limit";
+        else {
+            read = ReadPart(path, sheet.part, xml, &cut, total);
+            if (!read) reason = L"read-failed";
+        }
+        if (read) { ++loaded; ReadSheet(xml, shared, styles, rows, columns, truncated); }
+        metadata_chars -= sheet.name.size() * 2 + 512;
+        AppendSheet(payload, L"xlsx", sheet.name, rows, columns,
+                    truncated || cut || (!read && reason != L"not-loaded"), reason, false,
+                    ipc::kPreviewMaxTableChars - metadata_chars - 128);
     }
+    payload += L"W\t" + std::to_wstring(total_sheets) + L'\t' + std::to_wstring(loaded) +
+               L'\t' + std::to_wstring(sheet_index) + L'\n';
     bytes_read = static_cast<uint32_t>((std::min)(total, uint64_t{0xFFFFFFFFu}));
     return true;
 }

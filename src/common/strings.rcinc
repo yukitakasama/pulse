@@ -3040,6 +3040,8 @@ BEGIN
     IDS_UI_FONT_DEFAULT "标准"
     IDS_UI_FONT_LARGE "大"
     IDS_UI_FONT_LARGER "特大"
+    IDS_LIST_THUMBNAIL_BADGES "缩略图上显示打开方式图标"
+    IDS_LIST_THUMBNAIL_BADGES_DESC "在缩略图右下角显示默认打开程序的图标，视频另外标出时长，图片和视频一眼分清"
 END
 
 LANGUAGE 0x09, 0x01
@@ -3109,7 +3111,31 @@ BEGIN
     IDS_UI_FONT_DEFAULT "Default"
     IDS_UI_FONT_LARGE "Large"
     IDS_UI_FONT_LARGER "Larger"
+    IDS_LIST_THUMBNAIL_BADGES "Show the opening app on thumbnails"
+    IDS_LIST_THUMBNAIL_BADGES_DESC "Badge each thumbnail with its default app's icon and mark videos with their length, so photos and videos are easy to tell apart"
 END
 
 // Traditional Chinese (Taiwan), generated from the Simplified blocks above.
 #include "strings_zh_tw.rcinc"
+
+LANGUAGE 0x04, 0x02
+STRINGTABLE
+BEGIN
+    IDS_OP_AUTHORIZATION_REQUESTING "正在请求管理员授权"
+    IDS_OP_AUTHORIZATION_REQUIRED "需要管理员权限"
+    IDS_OP_RETRY_AUTHORIZATION "重试授权"
+    IDS_OP_SKIP_AUTHORIZATION "跳过此项"
+    IDS_OP_AUTHORIZATION_PROMPT "请在 Windows 提示中授权，然后继续此操作。"
+    IDS_OP_AUTHORIZATION_NOT_GRANTED "未获得管理员权限。可重试授权、跳过此项或取消。"
+END
+
+LANGUAGE 0x09, 0x01
+STRINGTABLE
+BEGIN
+    IDS_OP_AUTHORIZATION_REQUESTING "Requesting permission"
+    IDS_OP_AUTHORIZATION_REQUIRED "Permission required"
+    IDS_OP_RETRY_AUTHORIZATION "Retry authorization"
+    IDS_OP_SKIP_AUTHORIZATION "Skip item"
+    IDS_OP_AUTHORIZATION_PROMPT "Approve the Windows prompt to continue this operation."
+    IDS_OP_AUTHORIZATION_NOT_GRANTED "Administrator permission was not granted. Retry, skip this item, or cancel."
+END

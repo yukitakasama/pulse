@@ -73,4 +73,54 @@ ShellCommandResult LaunchShellCommand(const std::wstring& command, const std::ws
     if (execute.hProcess) CloseHandle(execute.hProcess);
     return {ERROR_SUCCESS, error, true};
 }
+TerminalLaunchResult LaunchTerminal(const std::wstring& executable, const std::wstring& arguments,
+    const std::wstring& directory, HWND owner, const ShellCommandApi& api) {
+    if (executable.empty()) return {ERROR_INVALID_PARAMETER, ERROR_INVALID_PARAMETER, false};
+    const auto working = pulse::path::StripExtendedPathPrefix(directory);
+    SHELLEXECUTEINFOW execute{sizeof(execute)};
+    execute.fMask = SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    execute.hwnd = owner;
+    execute.lpVerb = L"open";
+    execute.lpFile = executable.c_str();
+    execute.lpParameters = arguments.empty() ? nullptr : arguments.c_str();
+    execute.lpDirectory = working.empty() ? nullptr : working.c_str();
+    execute.nShow = SW_SHOWNORMAL;
+    if (api.shell_execute(&execute)) {
+        if (execute.hProcess) CloseHandle(execute.hProcess);
+        return {};
+    }
+    const DWORD error = GetLastError();
+    // The normal shell launch may already prompt. Only retry a reported 740;
+    // cancellation and other failures must not cause another UAC prompt.
+    if (error != ERROR_ELEVATION_REQUIRED) return {error, error, false};
+    execute.lpVerb = L"runas";
+    execute.hProcess = nullptr;
+    if (!api.shell_execute(&execute)) return {GetLastError(), error, true};
+    if (execute.hProcess) CloseHandle(execute.hProcess);
+    return {ERROR_SUCCESS, error, true};
+}
+
+std::wstring TerminalCommandLine(const std::wstring& dir) {
+    std::wstring quoted = L"\"";
+    size_t slashes = 0;
+    for (const wchar_t c : pulse::path::StripExtendedPathPrefix(dir)) {
+        if (c == L'\\') {
+            ++slashes;
+            continue;
+        }
+        if (c == L'\"') {
+            quoted.append(slashes * 2 + 1, L'\\');
+            quoted.push_back(c);
+        } else {
+            quoted.append(slashes, L'\\');
+            quoted.push_back(c);
+        }
+        slashes = 0;
+    }
+    // Backslashes immediately before a closing quote must be doubled.
+    quoted.append(slashes * 2, L'\\');
+    quoted.push_back(L'\"');
+    return L"-d " + quoted;
+}
+
 }

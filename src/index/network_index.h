@@ -126,7 +126,7 @@ private:
 };
 
 SearchResult MergeSearchResults(const Query& query, SearchResult local,
-                                SearchResult network);
+                                SearchResult network, bool deduplicate_paths = false);
 
 // #74: name search in a network folder that no ready network root covers. The
 // local index never holds SMB paths and the network index only answers for

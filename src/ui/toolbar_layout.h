@@ -4,6 +4,12 @@
 #include <array>
 
 namespace pulse::ui {
+inline float NavigationStep(float available, float scale) {
+    return (available < 500 * scale ? 26.0f : 34.0f) * scale;
+}
+inline D2D1_RECT_F NavigationButtonAt(float x, float y, float scale, float step) {
+    return {x, y, x + step - 4 * scale, y + 32 * scale};
+}
 struct ToolbarLayout {
     std::array<D2D1_RECT_F, 4> navigation{};
     D2D1_RECT_F address{}, search{}, create{};
@@ -20,10 +26,10 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
                                       float filter_width = 0.0f) {
     ToolbarLayout out;
     const float available = width - left;
-    const float nav_step = available < 500*scale ? 26*scale : 34*scale;
+    const float nav_step = NavigationStep(available, scale);
     float x = left + margin;
     for (int i=0;i<3;++i) {
-        out.navigation[i] = {x,top+6*scale,x+nav_step-4*scale,top+38*scale};
+        out.navigation[i] = NavigationButtonAt(x, top + 6 * scale, scale, nav_step);
         x += nav_step;
     }
     float search_width = std::clamp(available*0.27f, 140*scale, 360*scale);
@@ -40,8 +46,7 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
     if (available < 480*scale) {
         out.search.left=out.search.right-32*scale;
     }
-    out.navigation[3] = {out.search.left-margin-nav_step,top+6*scale,
-                         out.search.left-margin-4*scale,top+38*scale};
+    out.navigation[3] = NavigationButtonAt(out.search.left - margin - nav_step, top + 6 * scale, scale, nav_step);
     out.address.right = out.navigation[3].left-margin;
     out.create = {left+margin,top+50*scale,left+margin+create_width,top+82*scale};
     x = out.create.right + 12*scale;

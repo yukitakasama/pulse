@@ -1,6 +1,7 @@
 // ui_details_panel.cpp — Details panel draw and content height.
 #include "ui_renderer.h"
 #include "preview_footer_layout.h"
+#include "preview_notice.h"
 #include "ui_renderer_internal.h"
 #include "../common/localization.h"
 #include "tab_shape.h"
@@ -201,11 +202,12 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
         const D2D1_RECT_F overlayRc = D2D1::RectF(previewRc.left + 2.0f * s,
             previewRc.top + 2.0f * s, previewRc.right - 2.0f * s,
             previewRc.bottom - grip);
-        const D2D1_RECT_F contentRc = overlayRc;
+        D2D1_RECT_F contentRc = overlayRc;
         std::wstring previewText;
         bool truncated = false;
         uint32_t bytesRead = 0;
         std::wstring previewError;
+        preview::Integrity integrity;
         PreviewDrawResult previewResult = PreviewDrawResult::Failed;
         uint32_t pageCount = 1, pageDelay = 0;  // paged document: count > 1, delay 0
         if (preview_on && !d.is_dir && d.multi_count <= 1) {
@@ -217,8 +219,25 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
                     d.view_generation, d.modified_value, d.size_value, 1.0f,
                     &previewText, &truncated, &bytesRead, true, &previewError,
                     nullptr, nullptr, nullptr, nullptr, 0, &pageCount, &pageDelay, nullptr,
-                    nullptr, nullptr, nullptr, nullptr, &details_viewport_);
+                    nullptr, nullptr, nullptr, nullptr, &details_viewport_, nullptr,
+                    false, nullptr, nullptr, &integrity);
             }
+        }
+
+        const auto notice = PreviewNotice(previewError, previewText, integrity);
+        if (!handlerPreview && !notice.empty()) {
+            MakeBrush(dc, theme.fill_hover, brFillInput_);
+            dc->FillRectangle(overlayRc, brFillInput_.get());
+            const float noticeHeight = DrawPreviewNotice(dc, compositor_->DwriteFactory(),
+                compositor_->SmallFormat(), notice, overlayRc, s, theme.text, theme.fill_hover);
+            contentRc.top = std::min(contentRc.bottom, contentRc.top + noticeHeight);
+            if (previewResult == PreviewDrawResult::Bitmap && contentRc.bottom > contentRc.top)
+                details_cache_.Draw(dc, contentRc, d.path, d.attrs, 2048u,
+                    d.view_generation, d.modified_value, d.size_value, 1.0f,
+                    nullptr, nullptr, nullptr, true, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, &details_viewport_, nullptr,
+                    false, nullptr, nullptr, &integrity);
         }
 
         details_preview_ready_ = !placeholderOnly && !handlerPreview &&

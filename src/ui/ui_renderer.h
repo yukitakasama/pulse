@@ -6,11 +6,13 @@
 #include "fluent_components.h"
 #include "release_note_view.h"
 #include "shell_icons.h"
+#include "open_with_icons.h"
 #include "view_layout.h"
 #include "column_strip_layout.h"
 #include "panel_metrics.h"
 #include "toolbar_layout.h"
 #include "thumbnail_cache.h"
+#include "folder_thumbnail_cache.h"
 #include "archive_preview.h"
 #include "name_highlight.h"
 #include "preview_handler_host.h"
@@ -37,7 +39,7 @@ namespace pulse::ui {
 enum class PaneHeaderIcon;
 
 inline constexpr unsigned kSettingsContextExpandedMask = 0x1f00u;
-inline constexpr unsigned kSettingsDefaultExpandedMask = kSettingsContextExpandedMask | 0x3u;
+inline constexpr unsigned kSettingsDefaultExpandedMask = kSettingsContextExpandedMask | 0x7u;
 
 class BloomAccentPicker;
 
@@ -341,9 +343,9 @@ struct SidebarGroup {
     bool collapsed = false;
     bool hidden = false;           // Section menu: the group is not laid out at all.
     SidebarAddAction add_action = SidebarAddAction::None;
-    // The header title (icon + name) opens the section's own view (#80): only
-    // This PC has one. The rest of the header, and every other header, folds.
+    // The header title opens the section's own view; its chevron still folds.
     bool navigable = false;
+    std::wstring navigation_path; // Empty is This PC.
     bool tabs_section = false;     // vertical tabs block: set apart by a divider
 };
 
@@ -555,6 +557,23 @@ struct DuplicateDriveView {
     bool selected = false;
 };
 
+// HitTestResult::SettingsPackAction indices (Settings > 预览增强包).
+enum class PackAction : int {
+    Install = 0,        // FFmpeg pack: download and install
+    Remove,             // FFmpeg pack: uninstall
+    Enable,             // FFmpeg pack: on / off
+    UseCustom,          // use an FFmpeg already on this PC
+    Browse,             // choose that ffmpeg.exe
+    UseDetected,        // take the ffmpeg.exe found on PATH
+    OpenFolder,         // %LOCALAPPDATA%\Pulse\packs
+    RemoveOnUninstall,  // delete the packs with Pulse
+    ImagesInstall,      // image pack: download and install (or cancel)
+    ImagesRemove,       // image pack: uninstall
+    ImagesEnable,       // image pack: on / off
+    RawInstall, RawRemove, RawEnable,
+    ArchiveInstall, ArchiveRemove, ArchiveEnable,
+};
+
 struct WindowViewModel {
     std::wstring window_title;
     std::vector<TabView> tabs;
@@ -655,6 +674,36 @@ struct WindowViewModel {
     bool settings_content_instant = false;
     unsigned settings_expanded = kSettingsDefaultExpandedMask;
     unsigned settings_preview_codecs = 0;  // DetectPreviewCodecs() mask, General page only
+    // Settings > 预览增强包 (page 5), from SettingsController's cached pack state.
+    uint32_t settings_pack_ffmpeg = 0;          // 0 none, 1 pack installed, 2 own FFmpeg in use
+    bool settings_pack_ffmpeg_enabled = true;
+    bool settings_pack_use_custom = false;
+    bool settings_pack_remove_on_uninstall = true;
+    uint32_t settings_pack_installed = 0;       // installed pack count
+    bool settings_pack_media_available = false, settings_pack_images_available = false;
+    bool settings_pack_media_installed = false; // the FFmpeg pack itself is on disk
+    uint64_t settings_pack_bytes = 0;           // disk use of the packs folder
+    std::wstring settings_pack_version;         // installed FFmpeg pack version
+    std::wstring settings_pack_custom_path;     // chosen ffmpeg.exe
+    std::wstring settings_pack_detected_path;   // ffmpeg.exe found on PATH
+    std::wstring settings_pack_root;            // %LOCALAPPDATA%\Pulse\packs
+    std::wstring settings_pack_notice;          // last action's message, empty when none
+    bool settings_pack_installing = false;      // the FFmpeg pack is downloading
+    float settings_pack_progress = 0.0f;        // 0..1 while downloading
+    bool settings_pack_images_installed = false; // the image pack (现代图像格式) is on disk
+    bool settings_pack_images_enabled = true;
+    bool settings_pack_images_installing = false;
+    float settings_pack_images_progress = 0.0f;
+    std::wstring settings_pack_images_version;
+    std::wstring settings_pack_images_notice;
+    bool settings_pack_raw_installed = false, settings_pack_raw_enabled = true, settings_pack_raw_installing = false;
+    bool settings_pack_raw_available = false;
+    float settings_pack_raw_progress = 0.0f;
+    std::wstring settings_pack_raw_version, settings_pack_raw_notice;
+    bool settings_pack_archive_installed = false, settings_pack_archive_enabled = true, settings_pack_archive_installing = false;
+    bool settings_pack_archive_available = false;
+    float settings_pack_archive_progress = 0.0f;
+    std::wstring settings_pack_archive_version, settings_pack_archive_notice;
     int settings_theme = 0; // system, light, dark
     bool settings_open = false;
     int settings_page = 0; // 0 general, 1 search/index, 2 context menu, 3 about, 4 duplicates
@@ -670,6 +719,7 @@ struct WindowViewModel {
     bool settings_list_size_bar = false;
     bool settings_list_tag_names = false;
     bool settings_list_selection_outline = false;
+    bool settings_list_thumbnail_badges = true;
     bool settings_vertical_tabs = false;
     bool settings_show_hints = true;
     bool settings_tips_seen = false;   // any teaching bubble already shown
@@ -914,6 +964,7 @@ struct HitTestResult {
         ToolbarGroup,        // toolbar "Group" button / active chip: open the group menu
         ToolbarGroupClear,   // "x" on the active group chip: stop grouping
         SettingsPreviewStore,  // Settings > Quick Look formats: get a missing system extension (index = row)
+        SettingsPackAction,    // Settings > 预览增强包: index = PackAction
     } region = None;
     SidebarAddAction sidebar_action = SidebarAddAction::None;
     int index = -1;          // tab/row/sidebar item/tray batch/tray item.
@@ -1091,8 +1142,15 @@ public:
                  (task_pill_done_at_ != 0 && now - task_pill_done_at_ < kTaskPillDoneMs + 400);
         if (copy_feedback_.Tick(now)) active = true;
         if (group_wheel_.Tick(motion_now)) active = true;
+        if (folder_thumbnail_cache_.Tick(now)) active = true;
         return active;
     }
+    void RefreshFolderThumbnails() { folder_thumbnail_cache_.Refresh(); }
+    // A preview pack was installed, removed or switched: files that had no
+    // thumbnail may have one now, so cached results are dropped.
+    void EvictThumbnails() { thumbnail_cache_.Evict(); }
+    auto FolderThumbnailDebugStats() { return folder_thumbnail_cache_.ReadDebugStats(); }
+    void SetFolderThumbnailsEnabled(bool enabled) { folder_thumbnails_enabled_ = enabled; }
     // region = HitTestResult region of the button that copied, index its index.
     void NotifyCopied(int region, int index) {
         copy_feedback_.Trigger(region, index, GetTickCount64());
@@ -1161,6 +1219,10 @@ public:
         auto_widths_scale_ = -1.0f;
     }
     bool ListSmartDate() const { return list_smart_date_; }
+    // Grid thumbnails: default-program badge and video playing time.
+    void SetThumbnailBadges(bool on) { thumbnail_badges_ = on; }
+    // Default programs changed (SHCNE_ASSOCCHANGED).
+    void InvalidateOpenWithIcons() { open_with_icons_.InvalidateAssociations(); }
     // List-row hover buttons the user keeps: bit 0 star, bit 1 new tab, bit 2 more.
     void SetRowActions(unsigned mask) { row_actions_ = mask & 7u; }
     // Optional details columns (details_column_set.h bits).
@@ -1336,6 +1398,7 @@ private:
     void DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettingsContext(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawSettingsCore(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
+    void DrawSettingsPacks(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
 
     void DrawList(const PaneViewModel& vm, float x, float y, float w, float h, const Theme& theme,
                   int hover_region = 0, int hover_control_index = -1, bool pane_focused = true,
@@ -1366,12 +1429,20 @@ private:
                       float x, float y, float width, float height,
                       D2D1_DRAW_TEXT_OPTIONS options = D2D1_DRAW_TEXT_OPTIONS_CLIP);
     void DrawFolderIcon(float x, float y, float size, const Theme& theme);
+    PreviewDrawResult DrawEntryThumbnail(ID2D1DeviceContext* dc, const D2D1_RECT_F& dest,
+        const ListEntryView& entry, ViewMode mode, uint64_t generation, uint32_t pixels,
+        float opacity, bool align_bottom, D2D1_RECT_F* artwork, uint32_t* duration = nullptr);
     void DrawSidebarPeek(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme);
     void DrawFileIcon(float x, float y, float size, const Theme& theme);
     void DrawEntryIcon(const ListEntryView& entry, float x, float y, float size, const Theme& theme);
     void DrawLinkOverlay(float x, float y, float size, const Theme& theme, float opacity = 1.0f,
                          const std::wstring& label = {}, float expansion = 0.0f,
                          float right_limit = 0.0f, const D2D1_RECT_F* artwork = nullptr);
+    // Grid thumbnail corners: the default program's icon bottom-right, and a
+    // playing-time chip (videos) or "GIF" chip bottom-left. `artwork` is the
+    // drawn image, `icon_size` the item's icon square, both in pixels.
+    void DrawThumbnailBadges(const ListEntryView& entry, const D2D1_RECT_F& artwork, float icon_size,
+                             uint32_t duration_ms, const Theme& theme);
     // One item's icon mid view-switch (ui_view_morph.h): thumbnail and shell
     // icon cross-fade while the rect travels. dx/dy: the row transform.
     void DrawMorphIcon(const ListEntryView& entry, const PaneViewModel& vm,
@@ -1408,11 +1479,14 @@ private:
     Compositor* compositor_ = nullptr;
     fluent::Painter painter_;
     ShellIconCache icon_cache_;
+    OpenWithIconCache open_with_icons_;
     std::unordered_map<ID2D1Bitmap*, ComPtr<ID2D1Effect>> tray_shadows_;
     // Grid/list thumbnails and the details-pane preview decode through
     // separate hosts and budgets: a 2048 px selection preview (up to 16 MB)
     // must neither evict the visible grid nor queue ahead of it.
     ThumbnailCache thumbnail_cache_{96ull * 1024ull * 1024ull, 1024};
+    FolderThumbnailCache folder_thumbnail_cache_;
+    bool folder_thumbnails_enabled_ = true;
     ThumbnailCache details_cache_{48ull * 1024ull * 1024ull, 24};
     PreviewHandlerHost preview_handler_;
     HWND notify_hwnd_ = nullptr;
@@ -1440,6 +1514,7 @@ private:
     bool list_smart_date_ = true, list_zebra_ = true, list_size_bar_ = false;
     bool list_tag_names_ = false;
     bool list_selection_outline_ = false;
+    bool thumbnail_badges_ = true;
     unsigned row_actions_ = 7u;
     uint32_t details_columns_ = kDetailsColumnsDefault;
     // Motion state: highlight plates glide between items (ui_motion.h).
@@ -1515,6 +1590,7 @@ private:
     mutable ComPtr<ID2D1StrokeStyle> dashStroke_;
     ComPtr<ID2D1StrokeStyle> paneHeaderStroke_;
     ComPtr<ID2D1PathGeometry> link_arrow_geometry_;
+    ComPtr<ID2D1PathGeometry> play_triangle_geometry_;
     mutable ComPtr<ID2D1SolidColorBrush> brFpsBg_;
     mutable ComPtr<ID2D1SolidColorBrush> brFpsText_;
 

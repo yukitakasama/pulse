@@ -1,9 +1,9 @@
 #include "saved_search.h"
+#include "session.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
 
 #include <windows.h>
-#include <shlobj.h>
 #include <algorithm>
 
 namespace pulse::app {
@@ -73,14 +73,8 @@ std::vector<std::wstring> ExtractObjects(const std::wstring& json) {
 } // namespace
 
 std::wstring SavedSearchStore::DefaultPath() {
-    PWSTR local = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE,
-                                    nullptr, &local)) || !local) return {};
-    const std::wstring root = std::wstring(local) + L"\\Pulse";
-    CoTaskMemFree(local);
-    if (!CreateDirectoryW(root.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
-        return {};
-    return root + L"\\saved_searches.json";
+    const std::wstring root = GetPulseDataDir();
+    return root.empty() ? L"" : root + L"\\saved_searches.json";
 }
 
 bool SavedSearchStore::Load() {

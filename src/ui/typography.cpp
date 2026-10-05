@@ -217,8 +217,22 @@ HRESULT CreateRenderingParams(IDWriteFactory2* factory, HMONITOR monitor,
 
 void SetTextRenderMode(TextRenderMode mode) noexcept {
     const int value = std::clamp(static_cast<int>(mode), 0, 2);
-    if (g_text_render_mode.exchange(value, std::memory_order_relaxed) != value)
+    if (g_text_render_mode.exchange(value, std::memory_order_relaxed) != value) {
         g_generation.fetch_add(1, std::memory_order_relaxed);
+        EnumThreadWindows(GetCurrentThreadId(), [](HWND window, LPARAM) -> BOOL {
+            SendMessageW(window, TextBackendChangedMessage(), 0, 0);
+            EnumChildWindows(window, [](HWND child, LPARAM) -> BOOL {
+                SendMessageW(child, TextBackendChangedMessage(), 0, 0);
+                return TRUE;
+            }, 0);
+            return TRUE;
+        }, 0);
+    }
+}
+
+UINT TextBackendChangedMessage() noexcept {
+    static const UINT message = RegisterWindowMessageW(L"Pulse.TextBackendChanged");
+    return message;
 }
 
 TextRenderMode CurrentTextRenderMode() noexcept {
@@ -250,6 +264,24 @@ void InvalidateCaches() {
 
 std::uint64_t Generation() noexcept {
     return g_generation.load(std::memory_order_relaxed);
+}
+
+int EditFontPixels(float scale, float dip) noexcept {
+    return std::max(1, static_cast<int>(std::lround(dip * UiFontScale() * std::max(0.25f, scale))));
+}
+
+HFONT CreateEditFont(float scale, float dip) {
+    // Grayscale like the DirectWrite text (flat pixel geometry), not ClearType.
+    const int height = -EditFontPixels(scale, dip);
+    HFONT font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, PreferredTextFamily());
+    if (!font) {
+        font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+    return font;
 }
 
 D2D1_RECT_F SnapVerticalBounds(const D2D1_RECT_F& bounds) noexcept {

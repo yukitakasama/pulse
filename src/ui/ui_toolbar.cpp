@@ -16,8 +16,11 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
             const auto r=layout.navigation[i];
             if (r.right<=r.left) continue;
             const bool enabled=i==0 ? vm.can_go_back : i==1 ? vm.can_go_forward : true;
-            DrawButton(r,theme,enabled && IsHovered(vm,nav_hits[i]) ? theme.fill_hover : kTransparent,
-                nav_glyphs[i],L"",enabled ? theme.text_secondary : theme.text_disabled,true,true);
+            fluent::ButtonSpec button;
+            button.bounds = r; button.glyph = nav_glyphs[i];
+            button.state.enabled = enabled;
+            button.state.hovered = enabled && IsHovered(vm, nav_hits[i]);
+            painter_.DrawCommandButton(button);
         }
         // Breadcrumb address bar: segments clickable, empty area -> edit mode.
         D2D1_RECT_F addrRc = AddressBarRect(rect.right);

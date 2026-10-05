@@ -60,16 +60,26 @@ void TabController::WillChangeLayout() const {
 // new-tab setting may swap for the default location (empty = This PC).
 void TabController::OpenCreatedTab(WindowTabs& tabs, size_t index, std::wstring path,
                                    int group_id) {
-    const bool use_default = callbacks_.default_new_tab && callbacks_.default_new_tab(path);
+    if (callbacks_.default_new_tab) callbacks_.default_new_tab(path);
     WillChangeLayout();
-    tabs.NewTabAt(index, path);
-    if (group_id != 0) tabs.Active()->tab_group = group_id;
+    tabs.NewTabAtLocation(index, path);
+    if (group_id != 0) SetTabGroup(tabs, tabs.active, group_id);
     LayoutChanged();
     Tab* created = tabs.Active() ? tabs.Active()->ActiveFolder() : nullptr;
     if (!created) return;
-    // The model opens an empty path at C:\; This PC has to be set explicitly.
-    if (use_default && path.empty()) created->current_path.clear();
     if (callbacks_.load_tab) callbacks_.load_tab(*created);
+}
+
+void TabController::DuplicateTab(WindowTabs& tabs, size_t index) {
+    if (index >= tabs.items.size()) return;
+    const Tab* folder = tabs.items[index]->ActiveFolder();
+    const std::wstring path = folder ? folder->current_path : L"C:\\";
+    WillChangeLayout();
+    tabs.NewTabAtLocation(index + 1, path);
+    LayoutChanged();
+    if (callbacks_.load_tab) {
+        if (Tab* created = tabs.Active()->ActiveFolder()) callbacks_.load_tab(*created);
+    }
 }
 
 void TabController::ToggleGroupCollapse(WindowTabs& tabs, int group_id) {
@@ -115,11 +125,12 @@ uint32_t TabController::FirstUnusedColor(const WindowTabs& tabs) const {
 void TabController::CreateGroupAndEdit(WindowTabs& tabs, int tab_index, POINT screen_pt,
                                        ui::FluentMenu& menu) {
     if (tab_index < 0 || tab_index >= static_cast<int>(tabs.items.size())) return;
+    if (tabs.items[static_cast<size_t>(tab_index)]->pinned) return;
     TabGroup group;
     group.id = tabs.next_tab_group_id++;
     group.color_rgb = FirstUnusedColor(tabs);
     tabs.tab_groups.push_back(group);
-    tabs.items[static_cast<size_t>(tab_index)]->tab_group = group.id;
+    SetTabGroup(tabs, static_cast<size_t>(tab_index), group.id);
     Changed();
     ShowGroupMenu(tabs, group.id, screen_pt, menu);
 }
@@ -260,7 +271,7 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
     items.push_back(MenuItem(CmdTabPin,
         TabText(tab.pinned ? Text::TabUnpin : Text::TabPin), L"\xE718"));
     items.back().separator_after = true;
-    if (tab.tab_group == 0) {
+    if (!tab.pinned && tab.tab_group == 0) {
         items.push_back(MenuItem(CmdTabAddToNewGroup,
             TabText(tabs.tab_groups.empty() ? Text::TabCreateGroup : Text::TabNewGroup)));
         if (!tabs.tab_groups.empty()) {
@@ -275,7 +286,7 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
             items.push_back(std::move(join));
         }
         items.back().separator_after = true;
-    } else {
+    } else if (!tab.pinned) {
         items.push_back(MenuItem(CmdTabRemoveFromGroup, TabText(Text::TabRemoveGroup)));
         items.back().separator_after = true;
     }
@@ -289,15 +300,7 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
 
     const int command = menu.TrackPopup(screen_pt, std::move(items));
     if (command == CmdTabDuplicate) {
-        const Tab* folder = tab.ActiveFolder();
-        WillChangeLayout();
-        tabs.NewTabAt(static_cast<size_t>(tab_index) + 1,
-                      folder ? folder->current_path : L"C:\\");
-        LayoutChanged();
-        if (callbacks_.load_tab) {
-            if (Tab* created = tabs.Active()->ActiveFolder())
-                callbacks_.load_tab(*created);
-        }
+        DuplicateTab(tabs, static_cast<size_t>(tab_index));
     } else if (command == CmdTabNewRight) {
         const Tab* current = tabs.Active() ? tabs.Active()->ActiveFolder() : nullptr;
         OpenCreatedTab(tabs, static_cast<size_t>(tab_index) + 1,
@@ -346,8 +349,8 @@ void TabController::ShowTabMenu(WindowTabs& tabs, int tab_index, POINT screen_pt
         CloseTabs(tabs, tab_index + 1, static_cast<int>(tabs.items.size()) - 1);
     } else if (command >= CmdTabJoinGroupBase &&
                command < CmdTabJoinGroupBase + static_cast<int>(tabs.tab_groups.size())) {
-        tab.tab_group = tabs.tab_groups[static_cast<size_t>(command - CmdTabJoinGroupBase)].id;
-        NormalizeGroupRuns(tabs);
+        SetTabGroup(tabs, static_cast<size_t>(tab_index),
+                    tabs.tab_groups[static_cast<size_t>(command - CmdTabJoinGroupBase)].id);
     }
     Changed();
 }

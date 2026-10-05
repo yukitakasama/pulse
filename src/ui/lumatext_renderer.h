@@ -18,13 +18,18 @@ struct LumaTextStats {
     std::uint64_t surface_cache_misses = 0;
     std::uint64_t surface_cache_evictions = 0;
     std::uint64_t fallback_draws = 0;
+    std::uint64_t edit_directwrite_draws = 0;
+    std::uint64_t edit_directwrite_hits = 0;
+    std::uint64_t edit_layout_builds = 0;
+    std::uint64_t edit_layout_cache_hits = 0;
+    DWRITE_RENDERING_MODE edit_rendering_mode = DWRITE_RENDERING_MODE_DEFAULT;
 };
 
 class LumaTextRenderer {
 public:
     // Run the EDIT's default mouse handler without letting it paint, then the
-    // caller presents LumaText. Pass the same format used by PaintEdit so
-    // click-to-caret uses LumaText cluster positions, not GDI.
+    // caller presents DirectWrite. Pass the same format used by PaintEdit so
+    // click-to-caret uses the same cluster positions as the displayed text.
     LRESULT CallEditDefaultMouse(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                  IDWriteTextFormat* format = nullptr);
     LumaTextRenderer();

@@ -231,8 +231,8 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 r.region=HitTestResult::SettingsDropdown;r.index=ContainsPt(lay.effect_choice,x,y) ? 0 : 1;return r;
             }
             if(ContainsPt(lay.performance_row,x,y)) {r.region=HitTestResult::SettingsToggle;r.index=4;return r;}
-            for(int list_row=0;list_row<5;++list_row)
-                if(ContainsPt(lay.list_style_row[list_row],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=list_row<3 ? 17+list_row : (list_row==3 ? 22 : 33);return r;}
+            for(int list_row=0;list_row<6;++list_row)
+                if(ContainsPt(lay.list_style_row[list_row],x,y)) {r.region=HitTestResult::SettingsToggle;r.index=list_row<3 ? 17+list_row : (list_row==3 ? 22 : list_row==4 ? 33 : 34);return r;}
             const D2D1_RECT_F actions[]={lay.content_pause,lay.content_options,lay.content_rebuild};
             for(int i=0;i<3;++i) if(ContainsPt(actions[i],x,y)) {r.region=HitTestResult::SettingsContentAction;r.index=i+1;return r;}
 
@@ -522,6 +522,42 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
                 }
                 if (ContainsPt(lay.update_auto_row, x, y)) {
                     r.region = HitTestResult::SettingsToggle; r.index = 31; return r;
+                }
+            } else if (vm.settings_page == 5) {
+                // Buttons first: they sit inside the clickable rows.
+                const std::pair<const D2D1_RECT_F*, PackAction> pack_targets[] = {
+                    {&lay.pack_open, PackAction::OpenFolder},
+                    {&lay.pack_primary, vm.settings_pack_media_installed && !vm.settings_pack_installing
+                                            ? PackAction::Remove : PackAction::Install},
+                    {&lay.pack_enable, PackAction::Enable},
+                    {&lay.pack_images_primary, vm.settings_pack_images_installed && !vm.settings_pack_images_installing
+                                                   ? PackAction::ImagesRemove : PackAction::ImagesInstall},
+                    {&lay.pack_images_enable, PackAction::ImagesEnable},
+                    {&lay.pack_raw_primary, vm.settings_pack_raw_installed && !vm.settings_pack_raw_installing
+                        ? PackAction::RawRemove : PackAction::RawInstall},
+                    {&lay.pack_raw_enable, PackAction::RawEnable},
+                    {&lay.pack_archive_primary, vm.settings_pack_archive_installed && !vm.settings_pack_archive_installing
+                        ? PackAction::ArchiveRemove : PackAction::ArchiveInstall},
+                    {&lay.pack_archive_enable, PackAction::ArchiveEnable},
+                    {&lay.pack_detect, PackAction::UseDetected},
+                    {&lay.pack_browse, PackAction::Browse},
+                    {&lay.pack_custom_row, PackAction::UseCustom},
+                    {&lay.pack_remove_row, PackAction::RemoveOnUninstall},
+                };
+                for (const auto& [bounds, action] : pack_targets) {
+                    if (action == PackAction::Install && !pack_text::PrimaryEnabled(vm.settings_pack_media_available,
+                        vm.settings_pack_media_installed, vm.settings_pack_installing)) continue;
+                    if (action == PackAction::ImagesInstall && !pack_text::PrimaryEnabled(vm.settings_pack_images_available,
+                        vm.settings_pack_images_installed, vm.settings_pack_images_installing)) continue;
+                    if (action == PackAction::RawInstall && !pack_text::PrimaryEnabled(vm.settings_pack_raw_available,
+                        vm.settings_pack_raw_installed, vm.settings_pack_raw_installing)) continue;
+                    if (action == PackAction::ArchiveInstall && !pack_text::PrimaryEnabled(vm.settings_pack_archive_available,
+                        vm.settings_pack_archive_installed, vm.settings_pack_archive_installing)) continue;
+                    if (bounds->right > bounds->left && ContainsPt(*bounds, x, y)) {
+                        r.region = HitTestResult::SettingsPackAction;
+                        r.index = static_cast<int>(action);
+                        return r;
+                    }
                 }
             } else if (vm.settings_page == 4) {
                 for (int i = 0; i < 3; ++i) {

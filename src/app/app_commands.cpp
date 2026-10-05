@@ -5,6 +5,7 @@
 #include "app_column_view.h"
 #include "../ui/toolbar_layout.h"
 #include "app_internal.h"
+#include "app_sidebar_refresh.h"
 #include "tray_reveal.h"
 #include "group_wheel_ui.h"
 #include "text_diff.h"
@@ -479,8 +480,9 @@ void ShowTrayBatchMenu(AppState& s, POINT screen_pt) {
             spec.cancel_text = l10n::Get(l10n::StringId::Cancel);
             if (!ui::ShowConfirmDialog(s.hwnd, spec, s.darkMode, s.accentColor)) break;
         }
-        for (const auto& p : paths)
-            ShellExecuteW(s.hwnd, nullptr, p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        // The same open service as the list: long-path prefixes, the item's
+        // folder as working directory, and off the UI thread.
+        for (const auto& p : paths) s.ops.OpenWith(p);
         break;
     }
     case kReveal: {
@@ -692,6 +694,8 @@ void DispatchMenuCommand(AppState& s, int cmd) {
         if (const app::Tab* tab = ActiveTab(s)) ApplyGroupToAllFolders(s, tab->group_by);
         break;
     case app::CmdRefresh:
+        RequestSidebarRefresh(s);
+        s.renderer.RefreshFolderThumbnails();
         if (const auto* tab = ActiveTab(s)) {
             s.store.MarkDirty(tab->current_path);
             RefreshActiveTab(s);
@@ -1423,8 +1427,8 @@ void ShowSplitDropdown(AppState& s) {
 // Browser-style tab groups: named + colored; strip chips open the group popup.
 // ---------------------------------------------------------------------------
 void RefreshSidebarModel(AppState& s) {
-    s.sidebar = app::BuildSidebarModel(&s.recycle_info);
-    SyncSavedSearchSidebar(s);
+    RequestSidebarRefresh(s, true);
+    if (s.networkLocations) RequestNetworkLocations(s);
 }
 
 app::SidebarEntry* QuickAccessEntryForPath(AppState& s,
@@ -2225,6 +2229,7 @@ void ToggleQuickPreview(AppState& s) {
             }
         }
         s.quickPreview.Show(item, s.darkMode, effect, s.safeMode, zoom_from);
+        s.quickPreviewSelection.Reset(item.path);
     }
 }
 
@@ -2244,51 +2249,6 @@ void NavigateQuickPreview(AppState& s, int direction) {
         if(v.quickPreview.visible() && SelectedQuickPreviewItem(v,item)) v.quickPreview.Update(item);
     };
     if(!DeferContentSelection(s,update,true)) update(s);
-    InvalidateRect(s.hwnd, nullptr, FALSE);
-}
-
-void HandleQuickPreviewCommand(AppState& s, ui::QuickPreviewAction action, bool shift) {
-    if (!s.quickPreview.visible()) return;
-    app::Tab* tab = ActiveTab(s);
-    if (!tab || !tab->snapshot) return;
-    // Verbs act on the previewed entry only: re-focus it in case the list
-    // selection drifted while the preview window owned the keyboard.
-    const ui::QuickPreviewItem shown = s.quickPreview.item();
-    const int index = QuickPreviewEntryIndex(*tab, shown);
-    if (index < 0) return;
-    if (index != tab->selected_index || tab->SelectedCount() != 1) {
-        tab->SelectOnly(index);
-        EnsureRowVisible(s, *tab, index);
-    }
-    switch (action) {
-    case ui::QuickPreviewAction::Open: OpenSelected(s); break;
-    case ui::QuickPreviewAction::Cut: CollectToTray(s, true); break;
-    case ui::QuickPreviewAction::Copy: CollectToTray(s, false); break;
-    case ui::QuickPreviewAction::CopyPath: CopySelectedPath(s); break;
-    case ui::QuickPreviewAction::ToggleStar: {
-        const fs::DirEntry& entry = tab->EntryAt(static_cast<size_t>(index));
-        ToggleStarred(s, shown.path, entry.is_dir ? app::PlaceItemKind::Folder
-                                                  : app::PlaceItemKind::File);
-        s.quickPreview.SetStarred(s.places.IsStarred(shown.path));
-        break;
-    }
-    case ui::QuickPreviewAction::Rename:
-        // The rename editor is hosted by the main window; hand focus back first.
-        s.quickPreview.Close();
-        ShowRenameOverlay(s);
-        break;
-    case ui::QuickPreviewAction::Delete: {
-        const ui::WindowViewModel vm = BuildVm(s);
-        s.quickPreviewAnchorView = vm.pane.ViewIndex(index);
-        DeleteSelected(s, shift);
-        break;
-    }
-    case ui::QuickPreviewAction::Properties:
-        DispatchMenuCommand(s, app::CmdProperties);
-        break;
-    default:
-        break;
-    }
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -2394,6 +2354,7 @@ void ApplySettingsEffects(AppState& s, app::SettingsEffect effects) {
                                 s.appPrefs.list_selection_outline);
         s.renderer.SetDetailsColumns(s.appPrefs.details_columns);
         s.renderer.SetRowActions(app::RowActionMask(s.ctxMenuPrefs.builtin_hidden));
+        s.renderer.SetThumbnailBadges(s.appPrefs.list_thumbnail_badges);
     }
     if (app::HasEffect(effects, app::SettingsEffect::FolderSort)) {
         app::SetFolderSortMode(app::FolderSortModeFromInt(s.appPrefs.folder_sort_mode));

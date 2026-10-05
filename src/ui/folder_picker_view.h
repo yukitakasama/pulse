@@ -13,6 +13,9 @@
 
 namespace pulse::ui {
 
+class FolderPickerArt;
+enum class PickerViewMode { Details, MediumIcons, LargeIcons };
+
 enum PickerControl : int {
     kPickNone = 0,
     kPickClose = 1,
@@ -23,6 +26,8 @@ enum PickerControl : int {
     kPickPrimary = 6,
     kPickScrollbar = 7,
     kPickList = 8,      // empty space inside the list card
+    kPickForward = 9, kPickRefresh, kPickView, kPickHidden, kPickFilename,
+    kPickFilter, kPickSearch, kPickSort, kPickNewFolder,
     kPickPlace = 100,   // + place index
     kPickRow = 1000,    // + entry index
 };
@@ -37,6 +42,12 @@ struct PickerPlace {
 
 // Everything the picker draws.
 struct FolderPickerVisual {
+    PickerViewMode view = PickerViewMode::Details;
+    std::vector<int> selected_indices;
+    bool can_forward = false;
+    bool show_hidden = false;
+    bool validating = false;
+    std::wstring filename_text, filter_text, search_text, notice;
     PickerMode mode = PickerMode::Folder;
     std::wstring title;
     std::wstring current;        // "" = This PC
@@ -63,6 +74,9 @@ struct FolderPickerVisual {
 };
 
 struct FolderPickerLayout {
+    int columns = 1;
+    float scale = 1;
+    D2D1_RECT_F forward{}, refresh{}, view_button{}, hidden_button{}, filename{}, filter{}, search{}, sort{}, new_folder{};
     float width = 0.0f;
     float height = 0.0f;
     float title_bar = 0.0f;
@@ -86,7 +100,8 @@ FolderPickerLayout LayoutFolderPicker(float width, float height,
                                       const std::vector<PickerPlace>& places,
                                       const fluent::Painter& painter,
                                       const std::wstring& primary_text,
-                                      const std::wstring& cancel_text, float scale);
+                                      const std::wstring& cancel_text, float scale,
+                                      PickerViewMode view = PickerViewMode::Details, bool file_mode = false);
 float PickerContentHeight(const FolderPickerLayout& layout, size_t count);
 float ClampPickerScroll(const FolderPickerLayout& layout, size_t count, float scroll);
 // Scroll that brings row `index` into view.
@@ -96,6 +111,6 @@ int HitTestFolderPicker(const FolderPickerLayout& layout, const FolderPickerVisu
                         float x, float y);
 void DrawFolderPicker(Compositor& compositor, fluent::Painter& painter, const Theme& theme,
                       const FolderPickerVisual& visual, const FolderPickerLayout& layout,
-                      bool dark, bool high_contrast);
+                      bool dark, bool high_contrast, FolderPickerArt* art = nullptr);
 
 } // namespace pulse::ui

@@ -3,6 +3,8 @@
 #include "../common/localization.h"
 #include "about_info.h"
 #include "../ui/preview_format_catalog.h"
+#include "../ui/folder_picker_dialog.h"
+#include "../common/preview_packs.h"
 #include <shellapi.h>
 #include <algorithm>
 #include <cwctype>
@@ -45,20 +47,32 @@ constexpr SettingDestination destinations[]={
     {I::SettingsTheme,0,0},{I::SettingsThemeColor,0,0},{I::SettingsWindowEffect,0,0},{I::SettingsLanguage,0,0},{I::SettingsTextRender,0,0},{I::SettingsUiFontSize,0,0},
     {I::SettingsIntegration,0,0},{I::SettingsDefaultManager,0,0},{I::SettingsLaunch,0,0},{I::SettingsStartInTray,0,0},{I::SettingsKeepRunning,0,0},{I::SettingsNotifyIcon,0,0},
     {I::SettingsHomeFolder,0,0},{I::SettingsStartupOpen,0,0},{I::SettingsNewTabOpen,0,0},{I::SettingsCloseLastTab,0,0},{I::SettingsRowHeight,0,0},{I::SettingsShowPerformance,0,0},
-    {I::ListSmartDate,0,0},{I::ListZebraRows,0,0},{I::ListSizeBar,0,0},{I::ListTagNameColor,0,0},{I::ListSelectionOutline,0,0},{I::SettingsFolderSort,0,0},{I::SettingsConfirmDelete,0,0},
+    {I::ListSmartDate,0,0},{I::ListZebraRows,0,0},{I::ListSizeBar,0,0},{I::ListTagNameColor,0,0},{I::ListSelectionOutline,0,0},{I::ListThumbnailBadges,0,0},{I::SettingsFolderSort,0,0},{I::SettingsConfirmDelete,0,0},
     {I::SettingsWallpaper,0,1},{I::SettingsWallpaperLook,0,1},{I::SettingsWallpaperBlur,0,1},{I::SettingsTrayIcon,0,1},{I::SettingsShowHidden,0,1},{I::SettingsShowProtected,0,1},{I::PinnedNames,0,1},{I::SettingsVerticalTabs,0,1},{I::SettingsHints,0,1},{I::SettingsHintsReset,0,1},
     {I::SettingsBlankClickBack,0,1},{I::SettingsChangeTracking,0,1},{I::SettingsOpenFolders,0,0},{I::SettingsWinE,0,0},{I::SettingsThisPc,0,0},{I::SettingsExplorerWindows,0,0},{I::SettingsShellTags,0,1},
     {I::GlobalSearch,1,0},{I::GlobalSearchHotkey,1,0},{I::SearchPinyin,1,0},{I::ContentIndexManage,1,0},{I::IndexLocation,1,2},{I::LocalDrives,1,2},
-    {I::Exclusions,1,2},{I::ServerFolders,1,2},{I::SettingsContextMenu,2,0},{I::SettingsDuplicates,4,0},{I::SettingsAboutDiagnostics,3,0},{I::SettingsAutoUpdate,3,0},
+    {I::Exclusions,1,2},{I::ServerFolders,1,2},{I::SettingsContextMenu,2,0},{I::SettingsDuplicates,4,0},{I::QuickPreview,5,4},{I::SettingsAboutDiagnostics,3,0},{I::SettingsAutoUpdate,3,0},
 };
 std::vector<ui::FluentMenuItem> FilterSettings(const std::wstring& query) {
     std::wstring needle=query;std::transform(needle.begin(),needle.end(),needle.begin(),towlower);
     std::vector<ui::FluentMenuItem> items;
-    const I pages[]={I::SettingsGeneral,I::SettingsSearchIndex,I::SettingsContextMenu,I::SettingsAboutDiagnostics,I::SettingsDuplicates};
+    const I pages[]={I::SettingsGeneral,I::SettingsSearchIndex,I::SettingsContextMenu,I::SettingsAboutDiagnostics,I::SettingsDuplicates,I::QuickPreview};
     for(size_t i=0;i<std::size(destinations);++i) {
         auto item=Item(static_cast<int>(i)+1,destinations[i].title);
         item.shortcut=l10n::Get(pages[destinations[i].page]);
         std::wstring haystack=item.text+L" "+item.shortcut;
+        if (destinations[i].page == 5) {
+            // Translate each visible heading separately: the Traditional Chinese
+            // phrase table deliberately does not translate unknown concatenations.
+            const std::wstring aliases[] = {
+                l10n::Pick(L"支持的格式", L"Supported formats"),
+                l10n::Pick(L"预览增强包", L"Preview packs"),
+                l10n::Pick(L"系统扩展", L"System extensions"),
+                l10n::Pick(L"现代图像格式", L"Modern image formats"),
+                l10n::Pick(L"RAW 相机照片", L"RAW camera photos"),
+                l10n::Pick(L"压缩包", L"Archives")};
+            for (const auto& alias : aliases) haystack += L" " + alias;
+        }
         std::transform(haystack.begin(),haystack.end(),haystack.begin(),towlower);
         if(needle.empty() || haystack.find(needle)!=std::wstring::npos) items.push_back(std::move(item));
     }
@@ -114,15 +128,55 @@ bool HandleSettingsControl(AppState& s,const H& hit) {
     case H::SettingsDisclosure: {
         if((hit.index<0 || hit.index>3) && (hit.index<8 || hit.index>13)) return true; // 8-13: 右键菜单 cards
         s.settingsExpanded^=1u<<hit.index;
-        // Re-check the system extensions each time the formats card opens: the
-        // user may just have installed one from its "Get" button.
-        if(hit.index==2 && (s.settingsExpanded & 4u)) ui::DetectPreviewCodecs(true, s.hwnd);
+        if (hit.index == 2 && (s.settingsExpanded & 4u)) ui::DetectPreviewCodecs(true, s.hwnd);
         auto vm=BuildVm(s,false);
         const float maximum=s.renderer.SettingsMaxScroll(vm,static_cast<float>(s.compositor.Width()),static_cast<float>(s.compositor.Height()));
         s.settings.SetScroll(s.settings.scroll(),maximum);break;
     }
     case H::SettingsIntegration: s.settings.IntegrationAction(hit.index);break;
     case H::SettingsPreviewStore: ui::OpenPreviewCodecStore(s.hwnd,hit.index);break;
+    case H::SettingsPackAction: {
+        bool refresh=false;
+        switch(static_cast<ui::PackAction>(hit.index)) {
+        case ui::PackAction::Install: refresh=s.settings.InstallMediaPack(s.hwnd);break;
+        case ui::PackAction::Remove: refresh=s.settings.RemoveMediaPack();break;
+        case ui::PackAction::Enable: refresh=s.settings.ToggleMediaPack();break;
+        case ui::PackAction::ImagesInstall: refresh=s.settings.InstallImagePack(s.hwnd);break;
+        case ui::PackAction::ImagesRemove: refresh=s.settings.RemoveImagePack();break;
+        case ui::PackAction::ImagesEnable: refresh=s.settings.ToggleImagePack();break;
+        case ui::PackAction::RawInstall: refresh=s.settings.InstallRawPack(s.hwnd);break;
+        case ui::PackAction::RawRemove: refresh=s.settings.RemoveRawPack();break;
+        case ui::PackAction::RawEnable: refresh=s.settings.ToggleRawPack();break;
+        case ui::PackAction::ArchiveInstall: refresh=s.settings.InstallArchivePack(s.hwnd);break;
+        case ui::PackAction::ArchiveRemove: refresh=s.settings.RemoveArchivePack();break;
+        case ui::PackAction::ArchiveEnable: refresh=s.settings.ToggleArchivePack();break;
+        case ui::PackAction::UseCustom: refresh=s.settings.ToggleCustomFfmpeg();break;
+        case ui::PackAction::UseDetected: refresh=s.settings.UseDetectedFfmpeg();break;
+        case ui::PackAction::RemoveOnUninstall: s.settings.ToggleRemovePacksOnUninstall();break;
+        case ui::PackAction::Browse: {
+            ui::FolderPickerSpec spec;spec.mode=ui::PickerMode::File;
+            spec.title=l10n::Pick(L"选择 ffmpeg.exe",L"Choose ffmpeg.exe");
+            spec.filters={{L"ffmpeg.exe",L"ffmpeg.exe"}};
+            const auto& state=s.settings.Packs();
+            const std::wstring& current=!state.custom_path.empty() ? state.custom_path : state.detected_path;
+            if(!current.empty()) spec.initial_path=packs::DirectoryOf(current);
+            ui::FilePickerResult picked;
+            if(ui::ShowFilePicker(s.hwnd,spec,s.darkMode,s.accentColor,picked) && !picked.paths.empty())
+                refresh=s.settings.SetCustomFfmpeg(picked.paths.front());
+            break;
+        }
+        case ui::PackAction::OpenFolder: {
+            const std::wstring root=s.settings.Packs().root;
+            if(!root.empty() && packs::CreateDirectoryChain(root)) NewTab(s,root);
+            return true;
+        }
+        }
+        // Thumbnails that failed (or came from the other FFmpeg) are decoded again.
+        if(refresh) s.renderer.EvictThumbnails();
+        auto vm=BuildVm(s,false);
+        const float maximum=s.renderer.SettingsMaxScroll(vm,static_cast<float>(s.compositor.Width()),static_cast<float>(s.compositor.Height()));
+        s.settings.SetScroll(s.settings.scroll(),maximum);break;
+    }
     case H::SettingsGlobalSearchHotkey: SetFocus(s.hwnd);s.settings.BeginGlobalSearchHotkeyCapture();break;
     case H::SettingsTheme: SetThemeMode(s,hit.index);break;
     case H::SettingsDropdown: {

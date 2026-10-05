@@ -1155,15 +1155,15 @@ bool FluentMenu::IsPaletteHwnd(HWND hwnd) const {
 
 bool FluentMenu::EnsureFilterEdit() {
     if (!filter_fn_ || !hwnd_ || external_edit_) return false;
-    if (!edit_font_) {
-        const int height = -std::max(14, static_cast<int>(std::lround(14.0f * scale_)));
-        edit_font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, typography::PreferredTextFamily());
-        if (!edit_font_) {
-            edit_font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    // The menu outlives settings changes: follow the interface font size.
+    if (!edit_font_ || edit_font_generation_ != typography::Generation() ||
+        std::abs(edit_font_scale_ - scale_) > 0.001f) {
+        if (HFONT font = typography::CreateEditFont(scale_)) {
+            if (edit_font_) DeleteObject(edit_font_);
+            edit_font_ = font;
+            edit_font_generation_ = typography::Generation();
+            edit_font_scale_ = scale_;
+            if (edit_) SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(edit_font_), FALSE);
         }
     }
     if (edit_brush_) { DeleteObject(edit_brush_); edit_brush_ = nullptr; }
@@ -1173,7 +1173,7 @@ bool FluentMenu::EnsureFilterEdit() {
     edit_ = CreateChildEdit(hwnd_);
     if (!edit_) return false;
     SetWindowTheme(edit_, L"", L"");
-    if (!compositor_ || !compositor_->LumaTextEnabled())
+    if (!compositor_ || !compositor_->CustomEditEnabled())
         SetLayeredWindowAttributes(edit_, 0, 255, LWA_ALPHA);
     SendMessageW(edit_, WM_SETFONT, (WPARAM)edit_font_, TRUE);
     SendMessageW(edit_, EM_SETCUEBANNER, TRUE,
@@ -1207,17 +1207,7 @@ void FluentMenu::PlaceFilterEdit(int y_offset_px) {
         w = std::max(40, static_cast<int>(std::lround(text_r - text_l)));
         cell_h = std::max(18, static_cast<int>(std::lround(field_b - field_t)));
     }
-    int line_h = cell_h;
-    if (edit_font_) {
-        HDC hdc = GetDC(edit_);
-        HFONT old = static_cast<HFONT>(SelectObject(hdc, edit_font_));
-        TEXTMETRICW tm{};
-        GetTextMetricsW(hdc, &tm);
-        SelectObject(hdc, old);
-        ReleaseDC(edit_, hdc);
-        line_h = std::max(1, static_cast<int>(tm.tmHeight));
-    }
-    line_h = std::min(line_h, cell_h);
+    const int line_h = EditLineHeight(edit_, edit_font_, cell_h);
     y += std::max(0, (cell_h - line_h) / 2);
     POINT client{x, y};
     ScreenToClient(hwnd_, &client);
@@ -1259,113 +1249,37 @@ LRESULT CALLBACK FluentMenu::FilterEditProc(HWND hwnd, UINT msg, WPARAM wParam, 
                                             UINT_PTR, DWORD_PTR dwRefData) {
     auto* self = reinterpret_cast<FluentMenu*>(dwRefData);
     if (!self) return DefSubclassProc(hwnd, msg, wParam, lParam);
+    // Menu-specific: IME state, navigation keys and live filtering.
     if (msg == WM_IME_STARTCOMPOSITION) self->filter_composing_ = true;
     if (msg == WM_IME_ENDCOMPOSITION) self->filter_composing_ = false;
-    switch (msg) {
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONDBLCLK:
-    case WM_LBUTTONUP:
-    case WM_MOUSEMOVE:
-    case WM_CAPTURECHANGED:
-        if (self->compositor_ && self->compositor_->LumaTextEnabled()) {
-            const LRESULT result = self->compositor_->CallLumaEditMouse(
-                hwnd, msg, wParam, lParam, self->compositor_->TextFormat());
-            if (msg != WM_MOUSEMOVE || GetCapture() == hwnd) {
-                const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
-                const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
-                self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                                   fg, bg);
-            }
-            return result;
-        }
-        break;
-    case WM_KEYDOWN:
-    case WM_SYSKEYDOWN:
-        if (!self->filter_composing_ && (wParam == VK_ESCAPE || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RETURN)) {
-            self->HandleFilterKey(msg, wParam);
-            return 0;
-        }
-        break;
-    case WM_CHAR:
-        if (wParam == VK_RETURN || wParam == VK_ESCAPE) return 0;
-        {
-            LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
-            self->SyncFilterFromEdit();
-            return lr;
-        }
-    case WM_PASTE:
-    case WM_CUT:
-        {
-            LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
-            self->SyncFilterFromEdit();
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return lr;
-        }
-    case WM_PAINT: {
-        if (!self->compositor_ || !self->compositor_->LumaTextEnabled()) break;
-        HideCaret(hwnd);
-        const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
-        const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
-        if (!self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                                fg, bg)) {
-            PAINTSTRUCT ps{};
-            HDC hdc = BeginPaint(hwnd, &ps);
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-            if (!self->edit_brush_) {
-                self->edit_brush_ = CreateSolidBrush(
-                    self->dark_ ? RGB(30, 30, 30) : RGB(255, 255, 255));
-            }
-            FillRect(hdc, &rc, EditBackBrush(self->edit_brush_));
-            EndPaint(hwnd, &ps);
-        }
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && !self->filter_composing_ &&
+        (wParam == VK_ESCAPE || wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RETURN)) {
+        self->HandleFilterKey(msg, wParam);
         return 0;
     }
-    case WM_SETFOCUS: {
-        LRESULT lr = DefSubclassProc(hwnd, msg, wParam, lParam);
-        if (self->compositor_ && self->compositor_->LumaTextEnabled()) {
-            HideCaret(hwnd);
-            SetTimer(hwnd, 71, GetCaretBlinkTime(), nullptr);
-            const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
-            const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
-            self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                               fg, bg);
-        } else {
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return lr;
-    }
-    case WM_KILLFOCUS:
-        KillTimer(hwnd, 71);
-        break;
-    case WM_TIMER:
-        if (wParam == 71) {
-            if (GetCapture() != hwnd && self->compositor_ &&
-                self->compositor_->LumaTextEnabled()) {
-                const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
-                const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
-                self->compositor_->PresentLumaEdit(hwnd, self->compositor_->TextFormat(),
-                                                   fg, bg);
-            } else if (GetCapture() != hwnd) {
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-            return 0;
-        }
-        break;
-    case WM_ERASEBKGND:
-        if (self->compositor_ && self->compositor_->LumaTextEnabled()) return 1;
-        {
-            RECT rc{};
-            GetClientRect(hwnd, &rc);
-            if (!self->edit_brush_) {
-                self->edit_brush_ = CreateSolidBrush(
-                    self->dark_ ? RGB(30, 30, 30) : RGB(255, 255, 255));
-            }
-            FillRect(reinterpret_cast<HDC>(wParam), &rc, EditBackBrush(self->edit_brush_));
-            return 1;
+    if (msg == WM_CHAR && (wParam == VK_RETURN || wParam == VK_ESCAPE)) return 0;
+    // Everything visual is the shared hosted-edit handling: LumaText
+    // presentation, the caret timer, and the switch back to the native EDIT
+    // when a layered present fails (so the filter never turns invisible).
+    LRESULT result = 0;
+    if (!self->compositor_) {
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+    } else {
+        const D2D1_COLOR_F fg = ColorFromRef(EditTextColor(self->dark_));
+        const D2D1_COLOR_F bg = ColorFromRef(EditBackColor(self->dark_));
+        IDWriteTextFormat* format = self->compositor_->TextFormat();
+        if (!HandleChildEditMessage(*self->compositor_, format, fg, bg, EditBackBrush(self->edit_brush_),
+                                    hwnd, msg, wParam, lParam, result)) {
+            result = DefPresentedChildEditProc(*self->compositor_, format, fg, bg, hwnd, msg, wParam, lParam);
         }
     }
-    return DefSubclassProc(hwnd, msg, wParam, lParam);
+    // Delete has no WM_CHAR; every message that can change the text resyncs
+    // (SyncFilterFromEdit returns early when nothing changed).
+    if (!self->filter_composing_ &&
+        (msg == WM_CHAR || msg == WM_KEYDOWN || msg == WM_PASTE || msg == WM_CUT || msg == WM_CLEAR ||
+         msg == WM_UNDO || msg == WM_SETTEXT || msg == WM_IME_ENDCOMPOSITION))
+        self->SyncFilterFromEdit();
+    return result;
 }
 
 bool FluentMenu::AppendFilterChar(wchar_t ch) {

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 
 namespace pulse::ui::fluent {
@@ -345,6 +346,7 @@ struct EmptyStateSpec {
 };
 
 class Painter {
+    friend struct PainterTestPeer;
 public:
     explicit Painter(Compositor* compositor = nullptr) noexcept;
 
@@ -371,6 +373,8 @@ public:
     void DrawFocusRing(const D2D1_RECT_F& bounds, float radius);
 
     void DrawButton(const ButtonSpec& spec);
+    // Main toolbar and file picker command buttons share 20-DIP vector icons.
+    void DrawCommandButton(const ButtonSpec& spec);
     void DrawTextFieldFrame(const D2D1_RECT_F& bounds, const ControlState& state,
                            bool hosted_edit = false);
     void DrawTextField(const TextFieldSpec& spec);
@@ -508,6 +512,7 @@ private:
     bool high_contrast_ = false;
     bool dark_ = false;
     float format_scale_ = 0.0f;
+    std::uint64_t format_generation_ = 0;   // typography::Generation() of the formats
     std::array<ComPtr<ID2D1SolidColorBrush>, static_cast<size_t>(BrushId::Count)> brushes_{};
     ComPtr<ID2D1SolidColorBrush> scratch_brush_;
     ComPtr<ID2D1StrokeStyle> round_stroke_;

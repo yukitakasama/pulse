@@ -1,0 +1,191 @@
+name: Build FFmpeg preview pack
+
+# Decode-only LGPL FFmpeg for Pulse's optional media preview pack.
+# Run manually; a tag "pack-ffmpeg-<version>" publishes the zip and its
+# manifest to a release of that name, where Pulse's pack installer finds it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: FFmpeg release to build (e.g. 7.1.1)
+        required: true
+        default: '7.1.1'
+  push:
+    branches: ['codex/pack-download-build']
+    tags: ['pack-ffmpeg-[0-9]*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make diffutils tar xz curl
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-zlib mingw-w64-x86_64-dav1d
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/pack-ffmpeg-* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/pack-ffmpeg-}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.ffmpeg_version || '7.1.1' }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build
+        # Windows runners check out with CRLF; bash needs LF.
+        run: sed -i "s/\r$//" packs/ffmpeg/build.sh && bash packs/ffmpeg/build.sh "${{ steps.version.outputs.value }}" pack-out
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $ff = "pack-out/ffmpeg.exe"
+          $decoders = (& $ff -hide_banner -decoders) -join "`n"
+          foreach ($d in 'hevc','h264','vp9','libdav1d','prores','rv40','flv','mpeg2video','theora','aac','flac','ape','vorbis','opus','speex') {
+            if ($decoders -notmatch "\s$d\s") { throw "missing decoder: $d" }
+          }
+          $demuxers = (& $ff -hide_banner -demuxers) -join "`n"
+          foreach ($m in 'ogg','matroska,webm','mov,mp4,m4a,3gp,3g2,mj2','mpegts','flv','rm') {
+            if ($demuxers -notmatch "\s$([regex]::Escape($m))\s") { throw "missing demuxer: $m" }
+          }
+          & $ff -hide_banner -buildconf | Select-String -Pattern 'enable-gpl|enable-nonfree' | ForEach-Object { throw "GPL/nonfree flag in build: $_" }
+          $muxers = (& $ff -hide_banner -muxers) -join "`n"
+          foreach ($m in 's16le','f32le','wav','image2pipe') {
+            if ($muxers -notmatch "\s$([regex]::Escape($m))\s") { throw "missing muxer: $m" }
+          }
+          # Exercise PCM playback and accurate seeking without requiring lavfi.
+          $stream = [IO.File]::Create((Join-Path $PWD 'tone.wav'))
+          $writer = [IO.BinaryWriter]::new($stream)
+          try {
+            $dataSize = 32000
+            $writer.Write([Text.Encoding]::ASCII.GetBytes('RIFF'))
+            $writer.Write([int](36 + $dataSize))
+            $writer.Write([Text.Encoding]::ASCII.GetBytes('WAVEfmt '))
+            $writer.Write([int]16); $writer.Write([int16]1); $writer.Write([int16]1)
+            $writer.Write([int]8000); $writer.Write([int]16000)
+            $writer.Write([int16]2); $writer.Write([int16]16)
+            $writer.Write([Text.Encoding]::ASCII.GetBytes('data')); $writer.Write([int]$dataSize)
+            for ($i = 0; $i -lt 16000; $i++) {
+              $writer.Write([int16](12000 * [Math]::Sin(2 * [Math]::PI * 440 * $i / 8000)))
+            }
+          } finally { $writer.Dispose(); $stream.Dispose() }
+          & $ff -v error -y -i tone.wav -ac 1 -ar 8000 -f s16le tone.pcm
+          if ($LASTEXITCODE -ne 0 -or (Get-Item tone.pcm).Length -ne 32000) { throw 'PCM s16le output failed' }
+          & $ff -v error -y -ss 0.5 -i tone.wav -t 0.25 -ac 1 -ar 8000 -f s16le seek.pcm
+          if ($LASTEXITCODE -ne 0 -or (Get-Item seek.pcm).Length -ne 4000) { throw 'PCM input seeking failed' }
+          & $ff -v error -y -i tone.wav -ss 0.5 -t 0.25 -ac 1 -ar 8000 -f f32le seek-float.pcm
+          if ($LASTEXITCODE -ne 0 -or (Get-Item seek-float.pcm).Length -ne 8000) { throw 'PCM float output seeking failed' }
+          & $ff -v error -y -i tone.wav -af atempo=2 -ac 1 -ar 8000 -f s16le tempo.pcm
+          if ($LASTEXITCODE -ne 0 -or (Get-Item tempo.pcm).Length -lt 14400 -or (Get-Item tempo.pcm).Length -gt 17600) { throw 'PCM tempo playback failed' }
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'frames.rgb'), [byte[]]::new(48))
+          & $ff -v error -y -f rawvideo -pixel_format rgb24 -video_size 2x2 -framerate 4 -i frames.rgb -ss 0.25 -t 0.25 -c:v bmp -f image2pipe frame.bmp
+          if ($LASTEXITCODE -ne 0 -or (Get-Item frame.bmp).Length -eq 0) { throw 'Video output seeking failed' }
+      - name: Check the pack is self-contained
+        run: |
+          for exe in pack-out/ffmpeg.exe pack-out/ffprobe.exe; do
+            if objdump -p "$exe" | grep -iE 'DLL Name: (libwinpthread|libgcc|libstdc|libdav1d|zlib1)'; then
+              echo "$exe depends on a MinGW DLL"; exit 1
+            fi
+          done
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.value }}'
+          $zip = "pulse-pack-ffmpeg-$version-win64.zip"
+          Compress-Archive -Path pack-out/* -DestinationPath $zip
+          # Pulse downloads each file as <name>.lzms (Windows Compression API,
+          # present since Windows 8) and checks the hashes pinned in its source.
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.ComponentModel;
+          using System.Runtime.InteropServices;
+          public static class Lzms {
+              [DllImport("cabinet.dll", SetLastError = true)] static extern bool CreateCompressor(uint algorithm, IntPtr routines, out IntPtr handle);
+              [DllImport("cabinet.dll", SetLastError = true)] static extern bool Compress(IntPtr handle, byte[] data, UIntPtr size, byte[] output, UIntPtr outputSize, out UIntPtr written);
+              [DllImport("cabinet.dll")] static extern bool CloseCompressor(IntPtr handle);
+              public static byte[] Pack(byte[] data) {
+                  IntPtr handle;
+                  if (!CreateCompressor(5, IntPtr.Zero, out handle)) throw new Win32Exception();
+                  try {
+                      UIntPtr needed;
+                      Compress(handle, data, (UIntPtr)data.Length, null, UIntPtr.Zero, out needed);
+                      byte[] output = new byte[(int)needed.ToUInt64()];
+                      UIntPtr written;
+                      if (!Compress(handle, data, (UIntPtr)data.Length, output, (UIntPtr)output.Length, out written)) throw new Win32Exception();
+                      Array.Resize(ref output, (int)written.ToUInt64());
+                      return output;
+                  } finally { CloseCompressor(handle); }
+              }
+          }
+          '@
+          $sha = { param($p) (Get-FileHash $p -Algorithm SHA256).Hash.ToLower() }
+          $files = Get-ChildItem pack-out -File | Sort-Object Name | ForEach-Object {
+            $packed = "$($_.Name).lzms"
+            [IO.File]::WriteAllBytes((Join-Path $PWD $packed), [Lzms]::Pack([IO.File]::ReadAllBytes($_.FullName)))
+            [ordered]@{
+              name = $_.Name; size = $_.Length; sha256 = & $sha $_.FullName
+              packed = [ordered]@{ name = $packed; size = (Get-Item $packed).Length; sha256 = & $sha $packed }
+            }
+          }
+          # The block to paste into src/app/pack_catalog.h.
+          $base = "https://github.com/${{ github.repository }}/releases/download/pack-ffmpeg-$version/"
+          $lines = @("// pack-ffmpeg-$version, generated by .github/workflows/preview-pack-ffmpeg.yml",
+                     'inline constexpr PackFile kMediaPackFiles[] = {')
+          foreach ($f in $files) {
+            $lines += "    {L`"$($f.name)`", $($f.size), L`"$($f.sha256)`", $($f.packed.size), L`"$($f.packed.sha256)`"},"
+          }
+          $lines += '};'
+          $lines += "inline constexpr PackRelease kMediaPackRelease{L`"ffmpeg`", L`"$version`", L`"$base`","
+          $lines += '    kMediaPackFiles, sizeof(kMediaPackFiles) / sizeof(kMediaPackFiles[0])};'
+          $lines | Set-Content -Encoding utf8 pack-catalog.inc
+          "### pack_catalog.h`n``````cpp" | Add-Content $env:GITHUB_STEP_SUMMARY
+          $lines | Add-Content $env:GITHUB_STEP_SUMMARY
+          '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          $manifest = [ordered]@{
+            id = 'ffmpeg'; version = $version; license = 'LGPL-2.1-or-later'
+            archive = [ordered]@{ name = $zip; size = (Get-Item $zip).Length; sha256 = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() }
+            files = $files
+            min_pulse = '1.0.53'
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 "pulse-pack-ffmpeg-$version.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pack-ffmpeg
+          path: |
+            pulse-pack-ffmpeg-*.zip
+            pulse-pack-ffmpeg-*.json
+            *.lzms
+            pack-catalog.inc
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/pack-ffmpeg-')
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pack-ffmpeg
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          # --latest=false: Pulse's updater reads releases/latest/download/update-manifest.json,
+          # so a pack release must never become the repository's "latest" release.
+          gh release create $tag --repo '${{ github.repository }}' --latest=false --title "FFmpeg preview pack $($tag -replace 'pack-ffmpeg-','')" `
+            --notes 'Optional decode-only LGPL FFmpeg for Pulse previews. Installed from Settings > Preview packs.' `
+            (Get-ChildItem pulse-pack-ffmpeg-*, *.lzms, pack-catalog.inc)

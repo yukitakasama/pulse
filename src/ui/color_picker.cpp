@@ -890,7 +890,7 @@ constexpr UINT_PTR kEditCaretTimer = 71;
 
 bool PaintLumaEditControl(State& s, HWND hwnd, HDC hdc) {
     (void)hdc;
-    if (!s.compositor || !s.compositor->LumaTextEnabled()) return false;
+    if (!s.compositor || !s.compositor->CustomEditEnabled()) return false;
     HideCaret(hwnd);
     const D2D1_COLOR_F fg = ColorFromRef(HcEditText(s.dark ? RGB(255, 255, 255) : RGB(32, 32, 32)));
     const D2D1_COLOR_F bg = ColorFromRef(HcEditBack(s.dark ? RGB(45, 45, 45) : RGB(255, 255, 255)));
@@ -902,13 +902,14 @@ LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR,
     auto* hook = reinterpret_cast<EditHook*>(ref);
     State* s = hook ? hook->s : nullptr;
     if (!s) return DefSubclassProc(hwnd, msg, wp, lp);
+    const bool custom = s->compositor && SynchronizeChildEditBackend(*s->compositor, hwnd);
     switch (msg) {
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK:
     case WM_LBUTTONUP:
     case WM_MOUSEMOVE:
     case WM_CAPTURECHANGED:
-        if (s->compositor && s->compositor->LumaTextEnabled()) {
+        if (s->compositor && s->compositor->CustomEditEnabled()) {
             const LRESULT result = s->compositor->CallLumaEditMouse(
                 hwnd, msg, wp, lp, s->compositor->TextFormat());
             if (msg != WM_MOUSEMOVE || GetCapture() == hwnd)
@@ -917,7 +918,7 @@ LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR,
         }
         break;
     case WM_PAINT: {
-        if (!s->compositor || !s->compositor->LumaTextEnabled()) break;
+        if (!s->compositor || !s->compositor->CustomEditEnabled()) break;
         if (!PaintLumaEditControl(*s, hwnd, nullptr)) {
             PAINTSTRUCT ps{};
             HDC hdc = BeginPaint(hwnd, &ps);
@@ -930,11 +931,11 @@ LRESULT CALLBACK EditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR,
     }
     case WM_SETFOCUS: {
         LRESULT lr = DefSubclassProc(hwnd, msg, wp, lp);
-        HideCaret(hwnd);
-        SetTimer(hwnd, kEditCaretTimer, GetCaretBlinkTime(), nullptr);
-        if (s->compositor && s->compositor->LumaTextEnabled())
+        if (custom) {
+            HideCaret(hwnd);
+            SetTimer(hwnd, kEditCaretTimer, GetCaretBlinkTime(), nullptr);
             PaintLumaEditControl(*s, hwnd, nullptr);
-        else
+        } else
             InvalidateRect(hwnd, nullptr, FALSE);
         return lr;
     }
@@ -1152,31 +1153,13 @@ void CreateBrushes(State& s) {
 }
 
 void CreateEdits(State& s) {
-    const int height = -std::lround(14.0f * s.scale);
-    s.font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                         ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                         typography::PreferredTextFamily());
-    if (!s.font) {
-        s.font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                             L"Segoe UI");
-    }
-    if (s.font) {
-        HDC hdc = GetDC(nullptr);
-        HFONT old = static_cast<HFONT>(SelectObject(hdc, s.font));
-        TEXTMETRICW tm{};
-        GetTextMetricsW(hdc, &tm);
-        SelectObject(hdc, old);
-        ReleaseDC(nullptr, hdc);
-        s.line_h = (std::max)(1, static_cast<int>(tm.tmHeight));
-    }
+    s.font = typography::CreateEditFont(s.scale);
+    if (s.font) s.line_h = EditLineHeight(s.hwnd, s.font, 1 << 16);
     for (int i = 0; i < 5; ++i) {
         HWND e = CreateChildEdit(s.hwnd, L"", i < 4 ? ES_NUMBER : 0);
         if (!e) continue;
         SetWindowTheme(e, L"", L"");
-        if (!s.compositor || !s.compositor->LumaTextEnabled())
+        if (!s.compositor || !s.compositor->CustomEditEnabled())
             SetLayeredWindowAttributes(e, 0, 255, LWA_ALPHA);
         if (s.font) SendMessageW(e, WM_SETFONT, reinterpret_cast<WPARAM>(s.font), TRUE);
         SendMessageW(e, EM_SETLIMITTEXT, i < 4 ? 3 : 9, 0);

@@ -4,6 +4,10 @@
 #include <filesystem>
 #include <cstdio>
 
+namespace pulse::app {
+static std::wstring fixture;
+std::wstring GetPulseDataDir() { return fixture; }
+}
 using namespace pulse::app;
 
 namespace {
@@ -16,10 +20,10 @@ void Check(bool condition, const wchar_t* name) {
 }
 
 int wmain() {
-    wchar_t temp[MAX_PATH]{};
-    GetTempPathW(ARRAYSIZE(temp), temp);
-    const std::wstring path = std::wstring(temp) + L"pulse-saved-search-test.json";
-    DeleteFileW(path.c_str());
+    const auto dir = std::filesystem::absolute(L"bench_data/saved-search-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(dir);
+    fixture = dir.wstring();
+    const std::wstring path = fixture + L"\\explicit.json";
 
     SavedSearchStore store;
     Check(store.Add({L"源码内容", SavedSearchMode::Content, L"C:\\src", L"TODO", true}),
@@ -41,7 +45,18 @@ int wmain() {
           L"restore duplicate mode");
     Check(restored.Remove(0) && restored.items().size() == 1, L"remove saved search");
 
-    DeleteFileW(path.c_str());
+    Check(SavedSearchStore::DefaultPath() == fixture + L"\\saved_searches.json",
+          L"AUD-017 default path uses injected shared data root");
+    Check(store.Save(), L"AUD-017 save through shared isolated root");
+    SavedSearchStore isolated;
+    Check(isolated.Load() && isolated.items().size() == 2 && isolated.items()[0].name == L"源码内容",
+          L"AUD-017 default load reads isolated saved searches");
+    fixture += L"\\second";
+    std::filesystem::create_directories(fixture);
+    Check(restored.Save(), L"AUD-017 second isolated root saves independently");
+    Check(isolated.Load() && isolated.items().size() == 1 && isolated.items()[0].mode == SavedSearchMode::Duplicates,
+          L"AUD-017 switching shared root cannot mix saved searches");
+    std::filesystem::remove_all(dir);
     wprintf(L"%d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }

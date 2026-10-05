@@ -3,10 +3,12 @@
 // never show its child window); the waveform comes from AudioWaveform.
 #include "quick_preview_window.h"
 #include "../ipc/preview_protocol.h"
+#include "cover_palette.h"
 #include <d2d1helper.h>
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
+#include <iterator>
 
 namespace pulse::ui {
 namespace {
@@ -43,6 +45,13 @@ bool QuickPreviewWindow::IsAudioPreview() const {
     return video_.active() && VideoPreview::IsAudio(item_.path);
 }
 
+bool QuickPreviewWindow::AudioHover(POINT client) {
+    const float x = IsAudioPreview() && Inside(audio_wave_rect_, client) ? static_cast<float>(client.x) : -1.0f;
+    const bool changed = (x < 0) != (audio_hover_x_ < 0) || std::abs(x - audio_hover_x_) >= 1.0f;
+    audio_hover_x_ = x;
+    return changed;
+}
+
 bool QuickPreviewWindow::AudioMouseDown(POINT client) {
     if (!IsAudioPreview() || !Inside(audio_wave_rect_, client)) return false;
     const float width = (std::max)(1.0f, audio_wave_rect_.right - audio_wave_rect_.left);
@@ -70,8 +79,9 @@ void QuickPreviewWindow::DrawAudio(ID2D1DeviceContext* dc, const VideoPreview::S
     float y = content.top + (std::max)(pad * 0.5f, (h - total) * 0.5f);
     const float cx = content.left + w * 0.5f;
 
-    ComPtr<ID2D1SolidColorBrush> accent;
-    dc->CreateSolidColorBrush(dark_ ? D2D1::ColorF(0x60CDFF) : D2D1::ColorF(0x005FB8), &accent);
+    // Waveform colours: the cover's own (left to right), else the tile's.
+    uint32_t wave_colors[3] = {0xF6C26B, 0xD9655B, 0x6B4AA8};
+    bool grey_cover = false;
 
     // --- Cover: embedded album art through the preview host, else a tile. ---
     if (show_cover) {
@@ -79,7 +89,12 @@ void QuickPreviewWindow::DrawAudio(ID2D1DeviceContext* dc, const VideoPreview::S
         const uint32_t pixels = ipc::BucketPreviewPixelSize(static_cast<uint32_t>(cover));
         const PreviewDrawResult result = thumbnails_.Draw(dc, rect, item_.path, item_.attrs,
             pixels, generation_, item_.modified, item_.size, 1.0f, nullptr, nullptr, nullptr, true);
-        if (result != PreviewDrawResult::Bitmap) {
+        if (result == PreviewDrawResult::Bitmap) {
+            CoverPalette palette;
+            if (thumbnails_.Palette(item_.path, pixels, item_.modified, item_.size, palette))
+                std::copy(std::begin(palette.colors), std::end(palette.colors), wave_colors);
+            else grey_cover = true;   // black-and-white art: the accent instead
+        } else {
             const D2D1_GRADIENT_STOP stops[] = {
                 {0.0f, D2D1::ColorF(0xF6C26B)}, {0.55f, D2D1::ColorF(0xD9655B)},
                 {1.0f, D2D1::ColorF(0x6B4AA8)}};
@@ -149,36 +164,75 @@ void QuickPreviewWindow::DrawAudio(ID2D1DeviceContext* dc, const VideoPreview::S
     const float played = state.duration > 0
         ? std::clamp(static_cast<float>(state.position) / static_cast<float>(state.duration), 0.0f, 1.0f)
         : 0.0f;
-    ComPtr<ID2D1SolidColorBrush> rest;
-    dc->CreateSolidColorBrush(dark_ ? D2D1::ColorF(0xFFFFFF, 0.28f) : D2D1::ColorF(0x000000, 0.22f),
-                              &rest);
-    if (!accent.get() || !rest.get() || wave_w <= 8.0f) return;
+    // Played: a left-to-right gradient of the cover's colours. Unplayed:
+    // faint ink; under the pointer the gradient shows through at 60 %.
+    D2D1_GRADIENT_STOP stops[3];
+    const uint32_t accent_stops[3] = {dark_ ? 0x9BDFFFu : 0x2B88D8u, dark_ ? 0x60CDFFu : 0x005FB8u,
+                                      dark_ ? 0x6E8BFFu : 0x3B3BB0u};
+    for (int i = 0; i < 3; ++i)
+        stops[i] = {i * 0.5f, D2D1::ColorF(grey_cover ? accent_stops[i] : CoverPaletteThemed(wave_colors[i], dark_))};
+    ComPtr<ID2D1GradientStopCollection> collection;
+    ComPtr<ID2D1LinearGradientBrush> tint;
+    dc->CreateGradientStopCollection(stops, 3, &collection);
+    if (collection.get())
+        dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(
+            D2D1::Point2F(wave.left, 0.0f), D2D1::Point2F(wave.right, 0.0f)), collection.get(), &tint);
+    ComPtr<ID2D1SolidColorBrush> rest, rest_reflection;
+    dc->CreateSolidColorBrush(dark_ ? D2D1::ColorF(0xFFFFFF, 0.265f) : D2D1::ColorF(0x000000, 0.23f), &rest);
+    dc->CreateSolidColorBrush(dark_ ? D2D1::ColorF(0xFFFFFF, 0.062f) : D2D1::ColorF(0x000000, 0.048f),
+                              &rest_reflection);
+    if (!tint.get() || !rest.get() || !rest_reflection.get() || wave_w <= 8.0f) return;
     std::vector<float> peaks;
     float progress = 0.0f;
     bool failed = true;
     if (!waveform_.Snapshot(peaks, progress, failed)) failed = true;
-    const float mid = (wave.top + wave.bottom) * 0.5f;
     if (failed || peaks.empty()) {
+        const float mid = (wave.top + wave.bottom) * 0.5f;
         const float t = 1.5f * scale_;
-        dc->FillRectangle(D2D1::RectF(wave.left, mid - t, wave.right, mid + t), rest.get());
-        dc->FillRectangle(D2D1::RectF(wave.left, mid - t, wave.left + wave_w * played, mid + t),
-                          accent.get());
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(wave.left, mid - t, wave.right, mid + t), t, t),
+                                 rest.get());
+        if (played > 0.0f)
+            dc->FillRoundedRectangle(D2D1::RoundedRect(
+                D2D1::RectF(wave.left, mid - t, wave.left + wave_w * played, mid + t), t, t), tint.get());
         return;
     }
-    const float step = 3.5f * scale_;
-    const float bar = 2.0f * scale_;
-    const size_t bars = (std::max)(size_t{1}, static_cast<size_t>(wave_w / step));
+    // Pills on whole device pixels: 3 px wide, 2 px apart, centred; they rise
+    // from a baseline at 78 % of the height with a faint reflection below.
+    const float bar = (std::max)(2.0f, std::round(3.0f * scale_));
+    const float gap = (std::max)(1.0f, std::round(2.0f * scale_));
+    const float step = bar + gap;
+    const size_t bars = (std::max)(size_t{1}, static_cast<size_t>((wave_w + gap) / step));
+    const float left = std::round(wave.left + (wave_w - (static_cast<float>(bars) * step - gap)) * 0.5f);
+    const float base = std::round(wave.top + wave_h * 0.78f);
+    const float rise = base - wave.top - 2.0f * scale_;
+    const float drop = wave.bottom - base - 1.0f * scale_;
+    const float radius = bar * 0.5f;
     for (size_t i = 0; i < bars; ++i) {
         const size_t from = i * peaks.size() / bars;
         const size_t to = (std::max)(from + 1, (i + 1) * peaks.size() / bars);
-        float peak = 0.0f;
-        for (size_t k = from; k < to && k < peaks.size(); ++k) peak = (std::max)(peak, peaks[k]);
-        const float bh = (std::max)(2.0f * scale_, peak * wave_h);
-        const float x = wave.left + static_cast<float>(i) * step;
-        const bool done = static_cast<float>(i) / static_cast<float>(bars) < played;
-        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, mid - bh * 0.5f, x + bar,
-                                                               mid + bh * 0.5f), bar * 0.5f, bar * 0.5f),
-                                 done ? accent.get() : rest.get());
+        float level = 0.0f;
+        for (size_t k = from; k < to && k < peaks.size(); ++k) level = (std::max)(level, peaks[k]);
+        const float x = left + static_cast<float>(i) * step;
+        const bool done = (static_cast<float>(i) + 0.5f) / static_cast<float>(bars) < played;
+        const bool hovered = !done && audio_hover_x_ >= 0.0f && x <= audio_hover_x_;
+        const float up = (std::max)(bar, std::pow(level, 1.3f) * rise);
+        const D2D1_RECT_F pill = D2D1::RectF(x, std::round(base - up), x + bar, base);
+        if (done || hovered) {
+            tint->SetOpacity(done ? 1.0f : 0.6f);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(pill, radius, radius), tint.get());
+        } else {
+            dc->FillRoundedRectangle(D2D1::RoundedRect(pill, radius, radius), rest.get());
+        }
+        const float down = (std::min)(drop, up * 0.28f);
+        if (down <= 0.5f) continue;
+        const D2D1_RECT_F mirror = D2D1::RectF(x, base + 1.5f * scale_, x + bar, base + 1.5f * scale_ + down);
+        const float mr = (std::min)(radius, down * 0.5f);
+        if (done) {
+            tint->SetOpacity(0.22f);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(mirror, mr, mr), tint.get());
+        } else {
+            dc->FillRoundedRectangle(D2D1::RoundedRect(mirror, mr, mr), rest_reflection.get());
+        }
     }
 }
 

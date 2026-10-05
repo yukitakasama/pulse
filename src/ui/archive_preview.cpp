@@ -254,6 +254,15 @@ std::wstring ArchivePreview::SelectedPath() const {
 }
 
 std::wstring ArchivePreview::StateNote() const {
+    if (!filter_.empty()) {
+        if (format_ == L"ISO/UDF")
+            return pulse::l10n::Pick(L"仅搜索已加载的 ISO 兼容目录；UDF 内容可能缺失", L"Search: loaded ISO entries only; UDF may be missing");
+        if (incomplete_ || counting_)
+            return pulse::l10n::Pick(L"列表不完整；仅搜索已加载内容", L"Partial listing; search covers loaded entries only");
+        return pulse::l10n::Pick(L"仅搜索已加载内容", L"Search covers loaded entries only");
+    }
+    if (format_ == L"ISO/UDF")
+        return pulse::l10n::Pick(L"仅显示 ISO 兼容目录；UDF 内容可能缺失", L"ISO compatibility directory only; UDF may be missing");
     if (counting_) return pulse::l10n::Pick(L"\x7EDF\x8BA1\x4E2D\x2026", L"Counting\x2026");
     if (!incomplete_) return {};
     if (folder_)
@@ -342,6 +351,17 @@ int ArchivePreview::RowAt(float x, float y) const {
         return -1;
     const int row = static_cast<int>((y - tree_rect_.top + scroll_) / RowHeight());
     return row >= 0 && row < static_cast<int>(visible_.size()) ? row : -1;
+}
+
+bool ArchivePreview::SelectedIsDirectory() const {
+    return selected_ >= 0 && selected_ < static_cast<int>(visible_.size()) && nodes_[visible_[selected_]].dir;
+}
+
+bool ArchivePreview::SelectAt(float x, float y) {
+    selected_ = RowAt(x, y);
+    if (selected_ < 0) return false;
+    RevealSelection();
+    return true;
 }
 
 bool ArchivePreview::Click(float x, float y) {
@@ -520,16 +540,19 @@ float ArchivePreview::DrawHeader(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect
     } else {
     Fill(dc, t, 9.0f * s, HexColor(kArchiveAmber, 0.15f));
     DrawText(dc, chip_.Get(), format_, t, HexColor(kArchiveAmber), DWRITE_TEXT_ALIGNMENT_CENTER);
+    const bool image = format_ == L"ISO" || format_ == L"ISO/UDF" || format_ == L"UDF";
+    const std::wstring kind = image ? pulse::l10n::Pick(L"镜像", L"image") : pulse::l10n::Get(StringId::ArcArchive);
     if (large) {
         title = file_name_;
-        sub = format_ + L" " + pulse::l10n::Get(StringId::ArcArchive) + L" · " +
+        sub = format_ + L" " + kind + L" · " +
               pulse::format::ByteSize(file_size_);
     } else {
-        title = format_ + L" " + pulse::l10n::Get(StringId::ArcArchive) + L" · " +
+        title = format_ + L" " + kind + L" · " +
                 pulse::format::ByteSize(file_size_);
         sub = std::to_wstring(file_count_) + L" " + pulse::l10n::Get(StringId::ArcFiles) + L" · " +
               std::to_wstring(dir_count_) + L" " + pulse::l10n::Get(StringId::ArcFolders) + L" · " +
-              pulse::l10n::Get(StringId::ArcUnpacked) + L" " + pulse::format::ByteSize(unpacked_);
+              (image ? pulse::l10n::Pick(L"已读内容", L"Loaded content") : pulse::l10n::Get(StringId::ArcUnpacked)) +
+              L" " + pulse::format::ByteSize(unpacked_);
     }
     }
     DrawText(dc, title_.Get(), title, R(tx, t.top, rect.right, t.top + tile * 0.55f), theme.text);
@@ -747,6 +770,24 @@ void ArchivePreview::DrawTree(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, c
     }
 }
 
+float ArchivePreview::StateNoteHeight(float width) const {
+    const std::wstring note = StateNote();
+    if (note.empty() || width <= 0.0f || !factory_ || !small_) return 0.0f;
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(factory_->CreateTextLayout(note.c_str(), static_cast<UINT32>(note.size()),
+        small_.Get(), width, 1000.0f * scale_, &layout))) return 40.0f * scale_;
+    layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    DWRITE_TEXT_METRICS metrics{};
+    layout->GetMetrics(&metrics);
+    return metrics.height + 8.0f * scale_;
+}
+
+void ArchivePreview::DrawStateNote(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, const Theme& theme) {
+    small_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    DrawText(dc, small_.Get(), StateNote(), rect, theme.text_disabled);
+    small_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+}
+
 // ---------------------------------------------------------------- layout
 
 void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const D2D1_RECT_F& rect,
@@ -773,11 +814,9 @@ void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const 
         y += 4.0f * s;
         float bottom = r.bottom;
         if (incomplete_ || counting_ || !filter_.empty()) {
-            const std::wstring note = !filter_.empty()
-                ? Fmt2(StringId::ArcMatches, static_cast<int>(filter_hits_), static_cast<int>(file_count_))
-                : StateNote();
-            DrawText(dc, small_.Get(), note, R(r.left, bottom - 18.0f * s, r.right, bottom), theme.text_disabled);
-            bottom -= 22.0f * s;
+            const float note_height = StateNoteHeight(r.right - r.left);
+            DrawStateNote(dc, R(r.left, bottom - note_height, r.right, bottom), theme);
+            bottom -= note_height;
         }
         DrawTree(dc, R(rect.left + 4.0f * s, y, rect.right - 4.0f * s, bottom), theme, false);
         return;
@@ -800,7 +839,7 @@ void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const 
         {(folder_ && (incomplete_ || counting_) ? L"\x2265" : L"") + pulse::format::ByteSize(unpacked_),
          folder_ ? std::wstring(pulse::l10n::Pick(L"\x603B\x5927\x5C0F", L"Total size"))
                  : std::wstring(pulse::l10n::Get(StringId::ArcUnpacked)),
-         !folder_},
+         !folder_ && format_ != L"ISO" && format_ != L"ISO/UDF" && format_ != L"UDF"},
     };
     for (int i = 0; i < 3; ++i) {
         const float cx = left.left + i * (cardW + gap);
@@ -818,7 +857,7 @@ void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const 
         }
     }
     y += cardH + 6.0f * s;
-    if (unpacked_ > 0 && !folder_) {
+    if (unpacked_ > 0 && !folder_ && format_ != L"ISO" && format_ != L"ISO/UDF" && format_ != L"UDF") {
         const uint64_t packed = has_packed_ ? packed_total_ : file_size_;
         const int pct = static_cast<int>(std::lround(100.0 * (std::min)(1.0, static_cast<double>(packed) / unpacked_)));
         DrawText(dc, small_.Get(), Fmt(StringId::ArcRatio, pct), R(left.left, y, left.right, y + 18.0f * s), theme.text_disabled,
@@ -835,7 +874,8 @@ void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const 
     // Right: column header, tree, footer.
     const D2D1_RECT_F right = R(divX + pad * 0.5f, rect.top + pad * 0.5f, rect.right - pad * 0.5f, rect.bottom - pad * 0.5f);
     const float headH = 30.0f * s;
-    const float footH = 26.0f * s;
+    const std::wstring state_note = StateNote();
+    const float footH = 26.0f * s + StateNoteHeight(right.right - right.left - 22.0f * s);
     {
         const float w = right.right - right.left;
         const bool showPacked = has_packed_ && w > 560.0f * s;
@@ -854,13 +894,13 @@ void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const 
         Fill(dc, R(head.left, head.bottom - 1.0f, head.right, head.bottom), 0.0f, theme.stroke_divider);
     }
     DrawTree(dc, R(right.left, right.top + headH + 2.0f * s, right.right, right.bottom - footH), theme, true);
-    const D2D1_RECT_F foot = R(right.left + 12.0f * s, right.bottom - footH, right.right - 10.0f * s, right.bottom);
+    const D2D1_RECT_F foot = R(right.left + 12.0f * s, right.bottom - footH, right.right - 10.0f * s, right.bottom - footH + 26.0f * s);
+    if (!state_note.empty())
+        DrawStateNote(dc, R(foot.left, foot.bottom, foot.right, right.bottom), theme);
     Fill(dc, R(right.left, foot.top, right.right, foot.top + 1.0f), 0.0f, theme.stroke_divider);
     std::wstring left_note;
     if (!filter_.empty())
         left_note = Fmt2(StringId::ArcMatches, static_cast<int>(filter_hits_), static_cast<int>(file_count_));
-    else if (incomplete_ || counting_)
-        left_note = StateNote();
     else
         left_note = std::to_wstring(file_count_) + L" " + pulse::l10n::Get(StringId::ArcFiles) + L" · " +
                     std::to_wstring(dir_count_) + L" " + pulse::l10n::Get(StringId::ArcFolders);

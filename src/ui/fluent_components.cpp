@@ -310,9 +310,13 @@ void Painter::EnsureTextFormats() {
     if (!compositor_ || !compositor_->DwriteFactory() ||
         (body_format_.get() && caption_format_.get() &&
          small_icon_format_.get() && micro_icon_format_.get() &&
-         std::abs(format_scale_ - scale_) <= 0.001f)) {
+         std::abs(format_scale_ - scale_) <= 0.001f &&
+         format_generation_ == typography::Generation())) {
         return;
     }
+    // Every painter (main window, menus, dialogs) follows font settings the
+    // same way: formats are rebuilt when the typography generation moves.
+    format_generation_ = typography::Generation();
     body_format_.reset();
     nav_format_.reset();
     section_format_.reset();
@@ -686,6 +690,20 @@ void Painter::DrawFocusRing(const D2D1_RECT_F& bounds, float radius) {
     }
     const float width = std::max(1.0f, Px(theme_->focus_ring));
     StrokeRounded(Inflate(bounds, Px(1.0f)), radius + Px(1.0f), BrushId::Accent, width);
+}
+
+void Painter::DrawCommandButton(const ButtonSpec& spec) {
+    if (!dc_ || !theme_) return;
+    const auto& state = spec.state;
+    if (state.enabled && (state.hovered || state.selected))
+        FillRoundedRect(spec.bounds, Px(theme_->radius_control), state.hovered ? theme_->fill_hover : theme_->fill_selected);
+    const auto color = !state.enabled ? theme_->text_disabled : state.selected ? theme_->accent : theme_->text_secondary;
+    const auto command = command_icons::FromGlyph(spec.glyph);
+    EnsureStrokeStyle();
+    if (!command_icons::Draw(dc_, ScratchBrush(color), round_stroke_.get(), command,
+        command_icons::CenteredBounds(spec.bounds, Px(20.0f))))
+        DrawGlyph(spec.glyph, spec.bounds, color);
+    if (state.keyboard_focus) DrawFocusRing(spec.bounds, Px(theme_->radius_control));
 }
 
 void Painter::DrawButton(const ButtonSpec& spec) {

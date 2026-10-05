@@ -48,7 +48,12 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         pulse::l10n::StringId::SettingsDuplicates,
     };
     static constexpr const wchar_t* kNavIcon[] = {
-        kIconHome, kIconSearch, kIconSettings, kIconInfo, kIconCopy
+        kIconHome, kIconSearch, kIconSettings, kIconInfo, kIconCopy, L"\xE890"  // Quick Look
+    };
+    static_assert(std::size(kNavIcon) == kSettingsNavCount);
+    // Page 5 (快速预览) has no string-table entry; see pack_text.
+    auto nav_label = [](int page) -> std::wstring {
+        return page == 5 ? std::wstring(pack_text::Title()) : pulse::l10n::Get(kNav[page]);
     };
     // Hover plate and selection pill glide between rows (ui_motion.h); the
     // accent bar travels with the pill.
@@ -80,7 +85,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         DrawIconText(rc.left + (compact_nav ? 13.0f : 12.0f) * scale_, rc.top, 22.0f * scale_, rc.bottom - rc.top,
                      kNavIcon[i], L"*", active ? theme.accent : theme.text_secondary, 0.85f);
         MakeBrush(dc, theme.text, brText_);
-        if (!compact_nav) DrawTextRect(dc, compositor_->TextFormat(), brText_.get(), pulse::l10n::Get(kNav[i]),
+        if (!compact_nav) DrawTextRect(dc, compositor_->TextFormat(), brText_.get(), nav_label(i),
                      rc.left + 42.0f * scale_, rc.top, rc.right - rc.left - 48.0f * scale_,
                      rc.bottom - rc.top);
     }
@@ -98,7 +103,7 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         : vm.settings_page == 4 ? pulse::l10n::StringId::SettingsDuplicates
                                 : pulse::l10n::StringId::SettingsAboutDiagnostics;
     MakeBrush(dc, theme.text, brText_);
-    const auto& title = l10n::Get(page_title_id);
+    const std::wstring title = vm.settings_page == 5 ? std::wstring(pack_text::Title()) : l10n::Get(page_title_id);
     ComPtr<IDWriteTextLayout> title_layout;
     compositor_->DwriteFactory()->CreateTextLayout(title.c_str(), static_cast<UINT32>(title.size()),
         compositor_->HeaderFormat(), lay.content.right-lay.content.left-pad*2, 40*scale_, &title_layout);
@@ -107,6 +112,10 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
         title_layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0,static_cast<UINT32>(title.size())});
         dc->DrawTextLayout(D2D1::Point2F(lay.content.left+pad,origin+pad),title_layout.get(),brText_.get());
     }
+    if (vm.settings_page == 5)
+        painter_.DrawWrappedCaption(pack_text::Intro(),
+            D2D1::Point2F(lay.content.left+pad, origin+60*scale_),
+            lay.content.right-lay.content.left-2*pad, theme.text_secondary);
     if (vm.settings_page == 0 || vm.settings_page == 1)
         painter_.DrawText(l10n::Get(vm.settings_page == 0 ? l10n::StringId::SettingsGeneralIntro : l10n::StringId::SettingsSearchIntro),
             D2D1::RectF(lay.content.left+pad,origin+60*scale_,lay.content.right-pad,origin+84*scale_),
@@ -688,6 +697,8 @@ void MainRenderer::DrawSettings(const WindowViewModel& vm, const D2D1_RECT_F& re
                 }
             }
         }
+    } else if (vm.settings_page == 5) {
+        DrawSettingsPacks(vm, rect, theme);
     } else if (vm.settings_page == 4) {
         auto draw_card = [&](const D2D1_RECT_F& card) {
             if (card.right <= card.left || card.bottom <= card.top) return;
@@ -936,6 +947,7 @@ float MainRenderer::SettingsDestinationOffset(const WindowViewModel& vm, int set
     case I::ListSizeBar: target=l.list_style_row[2];break;
         case I::ListTagNameColor: target=l.list_style_row[3];break;
     case I::ListSelectionOutline: target=l.list_style_row[4];break;
+    case I::ListThumbnailBadges: target=l.list_style_row[5];break;
     case I::SettingsFolderSort: target=l.folder_sort_card;break;
     case I::SettingsTextRender: target=l.text_render_card;break;
     case I::SettingsUiFontSize: target=l.ui_font_size_card;break;

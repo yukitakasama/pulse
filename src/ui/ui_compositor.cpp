@@ -4,6 +4,7 @@
 #include "../common/localization.h"
 #include "lumatext_renderer.h"
 #include "typography.h"
+#include "FluentTokens.h"
 #include <commctrl.h>
 #include <prsht.h>
 #include <shellscalingapi.h>
@@ -211,7 +212,7 @@ bool Compositor::MeasureLumaText(std::wstring_view text, IDWriteTextFormat* form
 bool Compositor::PaintLumaEdit(HWND hwnd, HDC hdc, IDWriteTextFormat* format,
                                const D2D1_COLOR_F& foreground,
                                const D2D1_COLOR_F& background) {
-    if (!lumaText_ || !lumaText_->Enabled()) return false;
+    if (!CustomEditEnabled()) return false;
     return lumaText_->PaintEdit(hwnd, hdc, format, foreground, background);
 }
 
@@ -219,6 +220,9 @@ bool Compositor::PresentLumaEdit(HWND hwnd, IDWriteTextFormat* format,
                                  const D2D1_COLOR_F& foreground,
                                  const D2D1_COLOR_F& background) {
     if (!hwnd) return false;
+#if defined(PULSE_TEST_LUMATEXT_PRESENT_FAILURE)
+    if (GetEnvironmentVariableW(L"PULSE_TEST_LUMATEXT_PRESENT_FAILURE", nullptr, 0)) return false;
+#endif
     // LWA_ALPHA children use Windows' redirected surface. Mixing that mode
     // with UpdateLayeredWindow fails; paint our bitmap into their DC instead.
     DWORD layered_flags = 0;
@@ -233,17 +237,21 @@ bool Compositor::PresentLumaEdit(HWND hwnd, IDWriteTextFormat* format,
 
 LRESULT Compositor::CallLumaEditMouse(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                       IDWriteTextFormat* format) {
-    if (lumaText_ && lumaText_->Enabled())
+    if (CustomEditEnabled())
         return lumaText_->CallEditDefaultMouse(hwnd, msg, wParam, lParam, format);
-    SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
-    const LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
-    SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
-    HideCaret(hwnd);
-    return result;
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+bool Compositor::LumaTextAvailable() const noexcept {
+    return lumaText_ && lumaText_->Enabled();
 }
 
 bool Compositor::LumaTextEnabled() const noexcept {
-    return lumaText_ && lumaText_->Enabled();
+    return LumaTextAvailable() && typography::UseLumaTextForUi() && !IsHighContrast();
+}
+
+bool Compositor::CustomEditEnabled() const noexcept {
+    return LumaTextAvailable() && !IsHighContrast();
 }
 
 const LumaTextStats* Compositor::GetLumaTextStats() const noexcept {

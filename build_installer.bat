@@ -15,7 +15,7 @@ call "%~dp0build_release.bat" || exit /b 1
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\check_release_payload.ps1" -BuildDir "%~dp0build" || exit /b 1
 
-for %%F in (build\pulse.exe build\Pulse.Index.exe build\Pulse.Document.exe build\Pulse.Preview.exe build\pulse_shell.exe build\pulse_integration.exe build\lumatext.dll) do (
+for %%F in (build\pulse.exe build\Pulse.Index.exe build\Pulse.Document.exe build\Pulse.Preview.exe build\pulse_shell.exe build\pulse_elevated.exe build\pulse_integration.exe build\lumatext.dll) do (
     if not exist "%%F" (
         echo Missing build output: %%F
         exit /b 1

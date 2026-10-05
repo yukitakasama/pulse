@@ -1,6 +1,8 @@
 #include "../app/settings_controller.h"
 #include "../app/address_bar_command.h"
 #include "../app/session.h"
+#include "../app/layout_pane_selection.h"
+#include "../app/network_sidebar.h"
 #include "../app/context_menu_controller.h"
 #include "../app/single_instance_coordinator.h"
 #include "../app/tray_controller.h"
@@ -33,8 +35,9 @@
 
 namespace pulse::app {
 
+std::wstring test_prefs_directory;
 std::wstring GetPulseDataDir() {
-    return {};
+    return test_prefs_directory;
 }
 struct SettingsControllerTestPeer {
     static bool Start(SettingsController& controller, SettingsTask task,
@@ -292,6 +295,65 @@ bool TestDefaultFileManager() {
             on && off && !KeyExists(kThisPcClsid) &&
             !KeyExists(L"Software\\Classes\\CLSID\\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\\shell"));
     }
+    {
+        // Reproduce the remote pre-snapshot uninstall residue, without using
+        // the current writer to construct an artificially healthy fixture.
+        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software");
+        for (const auto* group : {L"Directory", L"Drive"}) {
+            const auto shell = std::wstring(L"Software\\Classes\\") + group + L"\\shell";
+            Write(shell.c_str(), nullptr, L"open");
+            Write((shell + L"\\open").c_str(), L"DelegateExecute", L"");
+        }
+        Write(kWinECommand, L"DelegateExecute", L"");
+        Write(kThisPcShell, nullptr, L"open");
+        Write(kThisPcCommand, L"DelegateExecute", L"");
+        wchar_t temp_path[MAX_PATH]{};
+        const DWORD temp_length = GetTempPathW(MAX_PATH, temp_path);
+        const auto prefs_directory = std::wstring(temp_path) + L"PulseLegacyPrefs-" +
+            std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+        const bool prefs_directory_created = temp_length > 0 && temp_length < MAX_PATH &&
+            CreateDirectoryW(prefs_directory.c_str(), nullptr);
+        passed &= Report("legacy repair preferences use an isolated temporary directory", prefs_directory_created);
+        if (prefs_directory_created) pulse::app::test_prefs_directory = prefs_directory;
+        AppPrefs prefs;
+        prefs.persist = false;
+        prefs.Load();
+        pulse::app::ContextMenuPrefs context;
+        pulse::index::IndexClient index;
+        pulse::index::NetworkAgentClient network;
+        pulse::app::SettingsController settings;
+        settings.BindUi(prefs, context, index, network, {});
+        passed &= Report("legacy orphan is shown as incomplete and offers restoration",
+            prefs.integration_residual && prefs.integration_incomplete && settings.IntegrationState() == 2 &&
+            settings.IntegrationCanRestore());
+        prefs.persist = true;
+        settings.IntegrationAction(6);
+        passed &= Report("explicit settings restore clears legacy orphan and refreshes status",
+            !prefs.integration_residual && !prefs.integration_incomplete && !KeyExists(kThisPcClsid) &&
+            settings.IntegrationState() == 0);
+        for (const auto* group : {L"Directory", L"Drive"}) {
+            const auto shell = std::wstring(L"Software\\Classes\\") + group + L"\\shell";
+            Write(shell.c_str(), nullptr, L"open");
+            Write((shell + L"\\open").c_str(), L"DelegateExecute", L"");
+        }
+        Write(kWinECommand, L"DelegateExecute", L"");
+        Write(kThisPcShell, nullptr, L"open");
+        Write(kThisPcCommand, L"DelegateExecute", L"");
+        AppPrefs migrated;
+        migrated.Load();
+        passed &= Report("startup automatically backs up and repairs the confirmed remote legacy signature",
+            !migrated.integration_residual && !migrated.integration_incomplete && !KeyExists(kThisPcClsid) &&
+            SnapshotExists(L"LegacyOrphanRepair"));
+        migrated.Load();
+        passed &= Report("repeated startup leaves repaired associations and backup intact",
+            !migrated.integration_residual && !KeyExists(kThisPcClsid) && SnapshotExists(L"LegacyOrphanRepair"));
+        pulse::app::test_prefs_directory.clear();
+        if (prefs_directory_created) {
+            const bool removed_file = DeleteFileW((prefs_directory + L"\\app.json").c_str()) != FALSE;
+            const bool removed_directory = RemoveDirectoryW(prefs_directory.c_str()) != FALSE;
+            passed &= Report("isolated legacy repair preferences are removed", removed_file && removed_directory);
+        }
+    }
     RegOverridePredefKey(HKEY_CURRENT_USER, nullptr);
     RegCloseKey(scratch);
     RegDeleteTreeW(HKEY_CURRENT_USER, scratch_path.c_str());
@@ -546,7 +608,160 @@ bool TestThisPc() {
     return passed;
 }
 
+static bool TestLayoutActivePane() {
+    using namespace pulse::app;
+    LayoutTab tab;
+    for (const auto* path : {L"C:\\first", L"C:\\second", L"C:\\third"}) {
+        auto pane = std::make_unique<Pane>();
+        pane->view.current_path = path;
+        tab.panes.push_back(std::move(pane));
+    }
+    auto* first = tab.panes[0].get();
+    auto* second = tab.panes[1].get();
+    auto* third = tab.panes[2].get();
+    third->view.back_stack.push(L"C:\\previous");
+    third->view.selected_index = 7;
+    third->view.selected.insert(7);
+    third->view.scroll_y = 125.0f;
+    third->view.filter_text = L"report";
+    third->view.view_mode = pulse::ui::ViewMode::Details;
+    third->view.details_column_dividers[0] = 245.0f;
+    bool ok = true;
+    auto visible = SelectLayoutPanes(tab.panes, third, 2, {first, second, third});
+    ok &= Report("layout: three to two retains the third active pane and order",
+        visible == std::vector<Pane*>{first, third});
+    visible = SelectLayoutPanes(tab.panes, first, 2, visible);
+    ok &= Report("layout: changing orientation retains the visible pair after focus moves",
+        visible == std::vector<Pane*>{first, third});
+    visible = SelectLayoutPanes(tab.panes, third, 1, visible);
+    ok &= Report("layout: shrinking to one retains the active pane",
+        visible == std::vector<Pane*>{third});
+    visible = SelectLayoutPanes(tab.panes, third, 2, visible);
+    ok &= Report("layout: re-expanding restores the original pair order",
+        visible == std::vector<Pane*>{first, third});
+    visible = SelectLayoutPanes(tab.panes, third, 3, visible);
+    ok &= Report("layout: full expansion restores every original pane",
+        visible == std::vector<Pane*>{first, second, third} &&
+        tab.panes[0].get() == first && tab.panes[1].get() == second &&
+        tab.panes[2].get() == third);
+    ok &= Report("layout: existing folder view state survives contraction and expansion",
+        third->view.current_path == L"C:\\third" &&
+        third->view.back_stack.top() == L"C:\\previous" &&
+        third->view.selected_index == 7 && third->view.selected.contains(7) &&
+        third->view.scroll_y == 125.0f && third->view.filter_text == L"report" &&
+        third->view.details_column_dividers[0] == 245.0f);
+
+    tab.focused_index = 2;
+    tab.target_index = 1;
+    tab.layout = LayoutPreset::TwoVertical;
+    tab.root = std::make_unique<SplitContainer>();
+    tab.root->is_leaf = false;
+    tab.root->first = std::make_unique<SplitContainer>();
+    tab.root->first->pane = first;
+    tab.root->second = std::make_unique<SplitContainer>();
+    tab.root->second->pane = third;
+    auto saved = CaptureLayoutTab(tab);
+    ok &= Report("layout: snapshot remaps active pane and drops hidden target",
+        saved.panes.size() == 2 && saved.panes[1].path == L"C:\\third" &&
+        saved.focused == 1 && saved.target == -1);
+    tab.target_index = 2;
+    saved = CaptureLayoutTab(tab);
+    ok &= Report("layout: snapshot remaps visible target", saved.target == 1);
+    LayoutTab restored;
+    RestoreLayoutTab(restored, saved, [](Tab& view, const std::wstring& path) {
+        view.current_path = path;
+    });
+    ok &= Report("layout: session restores the active view and target",
+        restored.focused_index == 1 && restored.target_index == 1 &&
+        restored.panes[1]->focused && restored.panes[1]->target &&
+        restored.panes[1]->view.current_path == L"C:\\third");
+
+    tab.layout = LayoutPreset::Single;
+    tab.root = std::make_unique<SplitContainer>();
+    tab.root->pane = third;
+    saved = CaptureLayoutTab(tab);
+    ok &= Report("layout: single-pane snapshot uses valid focus and target indices",
+        saved.panes.size() == 1 && saved.panes[0].path == L"C:\\third" &&
+        saved.focused == 0 && saved.target == 0);
+    tab.root.reset();
+    tab.panes.pop_back();
+    visible = SelectLayoutPanes(tab.panes, second, 1, {first, second});
+    visible = SelectLayoutPanes(tab.panes, second, 2, visible);
+    ok &= Report("layout: two to one to two retains both pane objects and their order",
+        visible == std::vector<Pane*>{first, second});
+    ok &= Report("layout: absent focus and empty ownership have valid fallbacks",
+        SelectLayoutPanes(tab.panes, nullptr, 1) == std::vector<Pane*>{first} &&
+        SelectLayoutPanes({}, nullptr, 1).empty());
+    return ok;
+}
+
+bool TestNetworkLocationsView() {
+    using namespace pulse::app;
+    SidebarModel sidebar;
+    SidebarEntry duplicate;
+    duplicate.label = L"System duplicate";
+    duplicate.path = L"\\\\SERVER\\share\\";
+    sidebar.system_networks.push_back(duplicate);
+    SidebarEntry imported;
+    imported.label = L"System location";
+    imported.path = L"\\\\offline.invalid\\other";
+    sidebar.system_networks.push_back(imported);
+    pulse::ui::SidebarGroup group;
+    pulse::ui::SidebarItem pin;
+    pin.label = L"My saved name";
+    pin.path = L"\\\\server\\share";
+    group.items.push_back(pin);
+    AppendSystemNetworkLocations(group, sidebar.system_networks);
+    bool ok = Report("network view: section title opens its own view",
+        group.navigable && group.navigation_path == L"pulse:networks");
+    ok &= Report("network view: pinned name wins over imported duplicate",
+        group.items.size() == 2 && group.items[0].label == L"My saved name");
+    ok &= Report("network view: imported offline location is displayed without probing",
+        group.items.back().path == imported.path && !group.items.back().status_dot);
+    AppendSystemNetworkLocations(group, sidebar.system_networks);
+    ok &= Report("network view: repeated merges do not duplicate locations", group.items.size() == 2);
+    return ok;
+}
+
+bool TestStaticMenuIdentity() {
+    using namespace pulse::app;
+    bool ok = true;
+    for (int scenario = 0; scenario != 5; ++scenario) {
+        ContextMenuController controller;
+        ContextMenuPrefs prefs;
+        std::wstring invoked;
+        ContextMenuController::ShellOperations operations;
+        operations.query = [](auto, HWND, bool, bool, auto) { return 17u; };
+        operations.execute_command = [&](const auto& command, const auto&) { invoked = command; };
+        controller.SetShellOperations(std::move(operations));
+        StaticVerb a{L"a", L"A", L"", L"cmd-a", {}};
+        StaticVerb b{L"b", L"B", L"", L"cmd-b", {}};
+        StaticVerb parent{L"parent", L"Parent", L"", L"", {a,b}};
+        const bool cascade = scenario == 1;
+        controller.CompleteStaticVerbs(L".txt", cascade ? std::vector<StaticVerb>{parent} :
+            std::vector<StaticVerb>{a,b}, controller.cache_generation());
+        controller.StartQuery(prefs, nullptr, {L"C:\\one.txt"}, false, L".txt", false,
+            [](const auto& path) { return path; }, {});
+        controller.OpenMenu({});
+        parent.children = {b,a};
+        controller.CompleteStaticVerbs(L".txt", cascade ? std::vector<StaticVerb>{parent} :
+            scenario == 2 ? std::vector<StaticVerb>{b} : std::vector<StaticVerb>{b,a},
+            controller.cache_generation());
+        if (scenario == 3) controller.NotePatchedDisplay();
+        if (scenario == 4) controller.CloseMenu();
+        controller.ExecuteShellCommand(CmdShellStaticBase + (cascade ? 1 : 0), {}, {});
+        const auto expected = scenario == 2 ? L"" : scenario == 3 ? L"cmd-b" : L"cmd-a";
+        ok &= Report("static menu displayed identity survives asynchronous refresh", invoked == expected);
+    }
+    return ok;
+}
+
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring(argv[1]) == L"--network-locations-view")
+        return TestNetworkLocationsView() ? 0 : 1;
+    if (argc == 2 && std::wstring(argv[1]) == L"--layout-active-pane")
+        return TestLayoutActivePane() ? 0 : 1;
+    if (argc == 2 && std::wstring(argv[1]) == L"--audit-identity") return TestStaticMenuIdentity() ? 0 : 1;
     if (argc == 2 && std::wstring(argv[1]) == L"--default-manager") {
         pulse::l10n::Initialize(GetModuleHandleW(nullptr), L"zh-CN");
         return TestDefaultFileManager() ? 0 : 1;
@@ -646,6 +861,35 @@ int wmain(int argc, wchar_t** argv) {
         settings.ToggleUi(101);
         passed &= Report("enabling a system item also enables its parent group",
             context.GroupEnabled(pulse::ipc::CtxMenuGroup::System));
+        {
+            // Handler rows are keyed "h:{CLSID}" and texts are free-form: a
+            // brace or quote inside them must not end "items" or "seen" early.
+            pulse::app::ContextMenuPrefs handlers;
+            handlers.persist = false;
+            handlers.ResetToDefaults();
+            const std::wstring first = pulse::ipc::HandlerCatalogKey(L"{11111111-2222-3333-4444-555555555555}");
+            const std::wstring second = pulse::ipc::HandlerCatalogKey(L"{66666666-7777-8888-9999-AAAAAAAAAAAA}");
+            handlers.RecordSeen(first, L"Ext } menu \"one\"", true, pulse::ipc::CtxMenuCategory::Software, true);
+            handlers.RecordSeen(second, L"Ext ] two", false, pulse::ipc::CtxMenuCategory::Software, true);
+            handlers.SetItemEnabled(first, false);
+            handlers.slow_ext[L"{11111111-2222-3333-4444-555555555555}"].deferred = true;
+            pulse::app::ContextMenuPrefs reloaded;
+            reloaded.persist = false;
+            reloaded.FromJson(handlers.ToJson());
+            auto has_seen = [&](const std::wstring& key) {
+                for (const auto& item : reloaded.seen)
+                    if (item.key == key) return true;
+                return false;
+            };
+            passed &= Report("handler catalog rows with brace keys survive reload",
+                has_seen(first) && has_seen(second));
+            const auto off = reloaded.item_enabled.find(first);
+            passed &= Report("handler item switches survive reload",
+                off != reloaded.item_enabled.end() && !off->second);
+            const auto slow = reloaded.slow_ext.find(L"{11111111-2222-3333-4444-555555555555}");
+            passed &= Report("slow extension state keyed by CLSID survives reload",
+                slow != reloaded.slow_ext.end() && slow->second.deferred);
+        }
         return passed ? 0 : 1;
     }
     if (argc == 2 && std::wstring(argv[1]) == L"--layout-search-prefs") {
@@ -1071,7 +1315,9 @@ int wmain(int argc, wchar_t** argv) {
         !parsed_prefs.confirm_recycle_delete);
     passed &= Report("outline selected items setting has localized text",
         !pulse::l10n::Get(pulse::l10n::StringId::ListSelectionOutline).empty() &&
-        !pulse::l10n::Get(pulse::l10n::StringId::ListSelectionOutlineDesc).empty());
+        !pulse::l10n::Get(pulse::l10n::StringId::ListSelectionOutlineDesc).empty() &&
+        !pulse::l10n::Get(pulse::l10n::StringId::ListThumbnailBadges).empty() &&
+        !pulse::l10n::Get(pulse::l10n::StringId::ListThumbnailBadgesDesc).empty());
     passed &= Report("selected items have no outline by default", !prefs.list_selection_outline);
     settings_ui.ToggleUi(33);
     passed &= Report("outline selected items enables and persists",

@@ -40,7 +40,9 @@ $testNames = @('pulse_rename_ops_test', 'pulse_child_edit_test', 'pulse_localiza
     'pulse_update_test', 'pulse_update_installer_test', 'pulse_update_session_test', 'pulse_app_controllers_test',
     'pulse_change_tracking_polling_test', 'pulse_change_tracking_test', 'pulse_index_delta_replay_test',
     'pulse_runtime_log_test', 'pulse_diagnostics_export_test', 'pulse_shell_command_test', 'pulse_reparse_entry_test',
-    'pulse_link_destination_test', 'pulse_link_pill_test', 'pulse_shell_icons_test',
+    'pulse_link_destination_test', 'pulse_link_pill_test', 'pulse_shell_icons_test', 'pulse_network_locations_test',
+    'pulse_archive_integrity_test', 'pulse_document_completeness_test', 'pulse_preview_command_test',
+    'pulse_image_preview_integrity_test', 'pulse_udf_listing_test', 'pulse_preview_integrity_test',
     'pulse_change_tracking_memory_test', 'pulse_change_feed_memory_test', 'pulse_usn_packet_queue_test',
     'pulse_content_progress_ui_test', 'pulse_operation_presentation_test', 'pulse_column_strip_test',
     'pulse_file_lock_test', 'pulse_dialogs_test')
@@ -85,6 +87,10 @@ foreach ($mode in @('--parent-cycle-only', '--quiet-maintenance-only', '--name-p
 }
 & (Join-Path $build 'pulse_app_controllers_test.exe') --layout-search-prefs
 if ($LASTEXITCODE -ne 0) { throw 'Panel layout/preferences regression failed' }
+foreach ($mode in @('--layout-active-pane', '--network-locations-view')) {
+    & (Join-Path $build 'pulse_app_controllers_test.exe') $mode
+    if ($LASTEXITCODE -ne 0) { throw "Panel/network navigation regression $mode failed" }
+}
 & (Join-Path $build 'pulse_change_feed_memory_test.exe') --probe
 if ($LASTEXITCODE -ne 0) { throw 'Opt-in memory probe regression failed' }
 foreach ($mode in @('--service-start-only', '--shutdown-only', '--live-dedup-only', '--folder-sizes-only')) {

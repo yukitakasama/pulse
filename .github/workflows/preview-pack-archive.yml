@@ -1,0 +1,46 @@
+name: Prepare archive preview pack
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Official 7-Zip version
+        required: true
+        default: '26.03'
+      installer_sha256:
+        description: Independently verified SHA256 of official x64 installer
+        required: true
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify official distribution
+        env:
+          PACK_VERSION: ${{ inputs.version }}
+          INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+        run: |
+          if ($env:PACK_VERSION -notmatch '^\d+\.\d+$' -or $env:INSTALLER_SHA256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Invalid release inputs' }
+          $compact = $env:PACK_VERSION.Replace('.', '')
+          New-Item -ItemType Directory -Force build/archivepack | Out-Null
+          $installer = "$PWD/build/archivepack/official.exe"
+          Invoke-WebRequest "https://github.com/ip7z/7zip/releases/download/$env:PACK_VERSION/7z$compact-x64.exe" -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $env:INSTALLER_SHA256) { throw 'Official installer hash mismatch' }
+          & 'C:/Program Files/7-Zip/7z.exe' x $installer '-obuild/archivepack/source' -y
+          if ($LASTEXITCODE) { throw 'Distribution extraction failed' }
+          & packs/archive/build.ps1 -SourceDirectory build/archivepack/source -Version $env:PACK_VERSION
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-pack-candidate
+          path: |
+            build/archivepack/pack/*
+            build/archivepack/files.json
+          if-no-files-found: error
+# Candidate artifacts only. Publish/install catalog entries only after verified
+# LZMS payloads and their source-pinned hashes exist; never advertise this job as
+# an available downloadable Pulse release.

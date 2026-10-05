@@ -296,8 +296,12 @@ void IndexClient::Writer() {
         {
             std::unique_lock<std::mutex> lock(mu_);
             pending_cv_.wait_for(lock, std::chrono::milliseconds(100),
-                [this] { return !running_ || have_pending_ || !cancelled_sessions_.empty() || volume_refresh_requested_; });
+                [this] { return !running_ || (connected_ &&
+                    (have_pending_ || !cancelled_sessions_.empty() || volume_refresh_requested_)); });
             if (!running_) return;
+            // Queued work must survive an outage without keeping this thread
+            // runnable. Worker notifies us after reconnecting.
+            if (!connected_) continue;
             if (!have_pending_ && cancelled_sessions_.empty() && !volume_refresh_requested_) continue;
         }
         if (connected_) {

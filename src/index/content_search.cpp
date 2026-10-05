@@ -520,10 +520,7 @@ bool MatchContentFilename(const std::wstring& path, uint64_t size, uint64_t modi
     for (const auto& group : q.groups) {
         bool match = true;
         for (const auto& term : group) {
-            const auto& text = term.name_in_path ? path : name;
-            if (term.folder || !MatchName(text.data(), static_cast<uint32_t>(text.size()), term) ||
-                !MatchExt(name.data(), static_cast<uint32_t>(name.size()), term) ||
-                !MatchSize(size, term) || !MatchDate(modified, term)) { match = false; break; }
+            if (!MatchTerm(path, name, false, size, modified, term)) { match = false; break; }
         }
         if (match) return true;
     }

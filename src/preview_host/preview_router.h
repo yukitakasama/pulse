@@ -54,6 +54,7 @@ struct DecodeResult {
     uint32_t frame_count = 1;
     uint32_t frame_delay_ms = 0;
     uint32_t loop_count = 0;
+    uint32_t duration_ms = 0;       // videos: playing time when the decoder learned it (media pack)
     ipc::PreviewTextEncoding text_encoding = ipc::PreviewTextEncoding::Unknown;  // Text only
     const char* decoder = nullptr;  // name of the entry that finished the request
 };

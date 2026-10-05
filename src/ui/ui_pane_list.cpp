@@ -1,3 +1,4 @@
+#include "file_item_selection.h"
 // ui_pane_list.cpp — Pane, list, empty states, columns, and icons.
 #include "ui_renderer.h"
 #include "ui_renderer_internal.h"
@@ -725,6 +726,30 @@ void MainRenderer::DrawFolderIcon(float x, float y, float size, const Theme& the
                          L"", L"", true, FILE_ATTRIBUTE_DIRECTORY);
 }
 
+PreviewDrawResult MainRenderer::DrawEntryThumbnail(ID2D1DeviceContext* dc,
+    const D2D1_RECT_F& dest, const ListEntryView& entry, ViewMode mode,
+    uint64_t generation, uint32_t pixels, float opacity, bool align_bottom,
+    D2D1_RECT_F* artwork, uint32_t* duration) {
+    if (entry.is_dir) {
+        const bool grid = mode == ViewMode::MediumIcons || mode == ViewMode::LargeIcons ||
+                          mode == ViewMode::ExtraLargeIcons;
+        const bool drive_root = (entry.path.size() == 3 && entry.path[1] == L':') ||
+            (entry.path.size() == 7 && entry.path.starts_with(L"\\\\?\\") && entry.path[5] == L':');
+        if (!folder_thumbnails_enabled_ || !grid || entry.is_link || entry.record_only || entry.cloud_recall || drive_root || IsHighContrast())
+            return PreviewDrawResult::Failed;
+        // Folder composites need only their on-screen resolution. In particular
+        // a 96 px large icon should not consume a 256 px CPU+GPU cache slot.
+        const float edge = std::max(dest.right - dest.left, dest.bottom - dest.top);
+        const uint32_t folder_pixels = edge <= 64.0f ? 64 : edge <= 128.0f ? 128 :
+                                       edge <= 256.0f ? 256 : 512;
+        return folder_thumbnail_cache_.Draw(dc, dest, entry.path, entry.attrs, folder_pixels,
+            generation, entry.modified_value, entry.size_value, opacity, align_bottom, artwork,
+            mode == ViewMode::MediumIcons);
+    }
+    return thumbnail_cache_.DrawGridThumbnail(dc, dest, entry.path, entry.attrs, pixels,
+        generation, entry.modified_value, entry.size_value, opacity, align_bottom, artwork, duration);
+}
+
 void MainRenderer::DrawFileIcon(float x, float y, float size, const Theme& theme) {
     (void)theme;
     if (compositor_ && compositor_->Dc())
@@ -810,6 +835,138 @@ void MainRenderer::DrawLinkOverlay(float x, float y, float size, const Theme& th
     }
     if (had_fill) brFillInput_->SetColor(previous_fill);
 }
+namespace {
+bool HasExtension(const std::wstring& name, std::initializer_list<const wchar_t*> extensions) {
+    const wchar_t* dot = PathFindExtensionW(name.c_str());
+    if (!dot || !*dot) return false;
+    for (const wchar_t* extension : extensions)
+        if (_wcsicmp(dot, extension) == 0) return true;
+    return false;
+}
+
+bool IsVideoName(const std::wstring& name) {
+    return HasExtension(name, {L".mp4", L".m4v", L".mov", L".mkv", L".webm", L".avi", L".wmv",
+        L".flv", L".mpg", L".mpeg", L".ts", L".mts", L".m2ts", L".3gp", L".3g2", L".asf", L".vob",
+        L".ogv"});
+}
+
+// 0:07, 12:34, 1:02:03 (Explorer's style; no leading zero on the first field).
+std::wstring FormatPlayingTime(uint32_t duration_ms) {
+    const uint32_t total = (duration_ms + 500) / 1000;
+    const uint32_t hours = total / 3600, minutes = total / 60 % 60, seconds = total % 60;
+    wchar_t text[32]{};
+    if (hours) swprintf_s(text, L"%u:%02u:%02u", hours, minutes, seconds);
+    else swprintf_s(text, L"%u:%02u", minutes, seconds);
+    return text;
+}
+} // namespace
+
+void MainRenderer::DrawThumbnailBadges(const ListEntryView& entry, const D2D1_RECT_F& artwork,
+                                       float icon_size, uint32_t duration_ms, const Theme& theme) {
+    auto* dc = compositor_ ? compositor_->Dc() : nullptr;
+    if (!dc || scale_ <= 0.0f) return;
+    const float art_w = artwork.right - artwork.left, art_h = artwork.bottom - artwork.top;
+    const float icon_dip = icon_size / scale_;
+    if (icon_dip < 40.0f || art_w < 20.0f * scale_ || art_h < 20.0f * scale_) return;
+    // Programs themselves (and installers) have no "opened by" program.
+    if (HasExtension(entry.name, {L".exe", L".msi", L".scr", L".com", L".appx", L".msix"})) return;
+    // Sizes follow Explorer: extra large / large / medium icons.
+    const bool large = icon_dip >= 160.0f, medium = !large && icon_dip >= 72.0f;
+    const float badge = (large ? 40.0f : medium ? 24.0f : 16.0f) * scale_;
+    const float inset = (large ? 8.0f : medium ? 4.0f : -3.0f) * scale_;
+    const float ring = (large ? 2.0f : 1.5f) * scale_;
+
+    const bool had_fill = brFillInput_.get() != nullptr;
+    const auto previous_fill = had_fill ? brFillInput_->GetColor() : theme.fill_input;
+    float badge_left = artwork.right;  // where the left chip has to stop
+
+    const auto icon = open_with_icons_.BadgeFor(entry.name, static_cast<uint32_t>(std::lround(badge)));
+    if (icon.bitmap) {
+        const float right = std::round(artwork.right - inset), bottom = std::round(artwork.bottom - inset);
+        const auto dest = D2D1::RectF(right - badge, bottom - badge, right, bottom);
+        const auto plate_rect = D2D1::RectF(dest.left - ring, dest.top - ring, dest.right + ring, dest.bottom + ring);
+        const float radius = (badge + ring * 2.0f) * 0.28f;
+        // Soft shadow, then a plate in the window color so the icon reads on
+        // any photo, then (pale Store logos) a dark inner plate.
+        const float drop = std::max(1.0f, scale_);
+        MakeBrush(dc, D2D1::ColorF(0, 0.22f), brFillInput_);
+        dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(plate_rect.left, plate_rect.top + drop,
+            plate_rect.right, plate_rect.bottom + drop), radius, radius), brFillInput_.get());
+        MakeBrush(dc, IsHighContrast() ? theme.bg : WithAlpha(theme.bg, 0.96f), brFillInput_);
+        dc->FillRoundedRectangle(D2D1::RoundedRect(plate_rect, radius, radius), brFillInput_.get());
+        if (icon.needs_plate) {
+            const float inner = std::max(0.0f, radius - ring);
+            MakeBrush(dc, D2D1::ColorF(0x2B2B2B), brFillInput_);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(dest, inner, inner), brFillInput_.get());
+        }
+        dc->DrawBitmap(icon.bitmap, &dest, 1.0f, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
+        badge_left = plate_rect.left;
+    }
+
+    // Small icons: the badge alone (a chip would cover the picture).
+    const bool video = duration_ms > 0 || IsVideoName(entry.name);
+    const bool gif = !video && HasExtension(entry.name, {L".gif"});
+    if ((video || gif) && !(icon_dip < 72.0f)) {
+        auto* format = compositor_->SmallFormat();
+        const float chip_h = std::round((large ? 20.0f : 16.0f) * scale_);
+        const float pad = (large ? 6.0f : 4.0f) * scale_;
+        const float chip_inset = (large ? 8.0f : 4.0f) * scale_;
+        const float glyph = chip_h * 0.42f;
+        const float left = std::round(artwork.left + chip_inset);
+        const float bottom = std::round(artwork.bottom - chip_inset);
+        const float room = badge_left - 4.0f * scale_ - left;
+        std::wstring label = gif ? L"GIF" : (large && duration_ms ? FormatPlayingTime(duration_ms) : std::wstring{});
+        float label_w = label.empty() || !format ? 0.0f :
+            MeasureLayoutText(compositor_, compositor_->DwriteFactory(), format, label);
+        const float glyph_w = video ? glyph + (label.empty() ? 0.0f : 4.0f * scale_) : 0.0f;
+        if (video && pad * 2.0f + glyph_w + label_w > room) { label.clear(); label_w = 0.0f; }
+        const float chip_w = video && label.empty() ? chip_h : pad * 2.0f + glyph_w + label_w;
+        if (chip_w <= room && chip_h < art_h * 0.5f) {
+            const auto chip = D2D1::RectF(left, bottom - chip_h, left + chip_w, bottom);
+            MakeBrush(dc, D2D1::ColorF(0, 0.6f), brFillInput_);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(chip, 4.0f * scale_, 4.0f * scale_), brFillInput_.get());
+            MakeBrush(dc, D2D1::ColorF(0xFFFFFF), brFillInput_);
+            float text_x = chip.left + pad;
+            if (video) {
+                if (!play_triangle_geometry_.get()) {
+                    ComPtr<ID2D1Factory> factory;
+                    dc->GetFactory(&factory);
+                    ComPtr<ID2D1PathGeometry> geometry;
+                    ComPtr<ID2D1GeometrySink> sink;
+                    if (factory.get() && SUCCEEDED(factory->CreatePathGeometry(&geometry)) &&
+                        SUCCEEDED(geometry->Open(&sink))) {
+                        // Unit play triangle, optically centred in its box.
+                        sink->BeginFigure({0.12f, 0.0f}, D2D1_FIGURE_BEGIN_FILLED);
+                        sink->AddLine({1.0f, 0.5f});
+                        sink->AddLine({0.12f, 1.0f});
+                        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                        if (SUCCEEDED(sink->Close())) play_triangle_geometry_ = std::move(geometry);
+                    }
+                }
+                if (play_triangle_geometry_.get()) {
+                    const float gx = label.empty() ? chip.left + (chip_w - glyph) * 0.5f + glyph * 0.06f : text_x;
+                    const float gy = chip.top + (chip_h - glyph) * 0.5f;
+                    D2D1_MATRIX_3X2_F previous_transform;
+                    dc->GetTransform(&previous_transform);
+                    dc->SetTransform(D2D1::Matrix3x2F::Scale(glyph, glyph) *
+                        D2D1::Matrix3x2F::Translation(gx, gy) * previous_transform);
+                    dc->FillGeometry(play_triangle_geometry_.get(), brFillInput_.get());
+                    dc->SetTransform(previous_transform);
+                }
+                text_x += glyph_w;
+            }
+            if (!label.empty() && format) {
+                const auto previous_alignment = format->GetParagraphAlignment();
+                format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                DrawTextEndEllipsis(dc, compositor_->DwriteFactory(), format, brFillInput_.get(), label,
+                    text_x, chip.top, label_w + 2.0f * scale_, chip_h);
+                format->SetParagraphAlignment(previous_alignment);
+            }
+        }
+    }
+    if (had_fill) brFillInput_->SetColor(previous_fill);
+}
+
 void MainRenderer::DrawEntryIcon(const ListEntryView& entry, float x, float y, float size,
                                  const Theme& theme) {
     const auto dest = D2D1::RectF(x, y, x + size, y + size);
@@ -864,11 +1021,10 @@ void MainRenderer::DrawMorphIcon(const ListEntryView& entry, const PaneViewModel
         // Shrinking: the old view's decode is already cached. Growing: request
         // the new size; the cache shows any other decoded size meanwhile.
         const bool use_from = thumb_from && !thumb_to;
-        thumb = thumbnail_cache_.DrawGridThumbnail(dc, icon, entry.path, entry.attrs,
+        thumb = DrawEntryThumbnail(dc, icon, entry, use_from ? from_mode : vm.view_mode, vm.view_generation,
             ThumbnailRequestPixels(use_from ? from_mode : vm.view_mode,
                                    use_from ? from_size : target_size),
-            vm.view_generation, entry.modified_value, entry.size_value, thumb_alpha,
-            true, &thumbnail_artwork)
+            thumb_alpha, true, &thumbnail_artwork)
             == PreviewDrawResult::Bitmap;
     }
     // The settled view's icon is converted on the icon worker meanwhile, so
@@ -1038,8 +1194,8 @@ void MainRenderer::DrawMorphFrom(const PaneViewModel& vm, const motion::ViewMorp
         const D2D1_RECT_F dest = D2D1::RectF(was.icon.left, was.icon.top,
                                              was.icon.left + size, was.icon.top + size);
         const bool thumb = !e.record_only && UsesThumbnails(mode) &&
-            thumbnail_cache_.DrawGridThumbnail(dc, was.icon, e.path, e.attrs, ThumbnailRequestPixels(mode, size),
-                vm.view_generation, e.modified_value, e.size_value, 1.0f, grid, nullptr) == PreviewDrawResult::Bitmap;
+            DrawEntryThumbnail(dc, was.icon, e, mode, vm.view_generation,
+                ThumbnailRequestPixels(mode, size), 1.0f, grid, nullptr) == PreviewDrawResult::Bitmap;
         if (thumb) continue;
         if (ID2D1Bitmap* bitmap = e.record_only ? nullptr
                 : icon_cache_.CachedBitmapFor(e.path, e.name, e.is_dir, e.attrs, size)) {
@@ -1928,21 +2084,8 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
     const bool detailsView = vm.view_mode == ViewMode::Details;
     D2D1_COLOR_F zebraColor = theme.text;
     zebraColor.a = (theme.bg.r < 0.5f) ? 0.035f : 0.025f;
-    // #78: the focused pane's selection is an accent gradient, strongest beside
-    // the indicator bar. Unfocused panes keep their neutral fill and high
-    // contrast keeps the system highlight.
-    ComPtr<ID2D1LinearGradientBrush> selection_gradient;
-    if (pane_focused && !IsHighContrast()) {
-        const D2D1_GRADIENT_STOP stops[] = {{0.0f, theme.list_selected_start},
-                                            {1.0f, theme.list_selected_end}};
-        ComPtr<ID2D1GradientStopCollection> collection;
-        if (SUCCEEDED(dc->CreateGradientStopCollection(stops, 2, &collection)) && collection.get()) {
-            dc->CreateLinearGradientBrush(
-                D2D1::LinearGradientBrushProperties(D2D1::Point2F(0.0f, 0.0f),
-                                                    D2D1::Point2F(1.0f, 0.0f)),
-                collection.get(), &selection_gradient);
-        }
-    }
+    FileItemSelectionPainter selection_painter(dc, theme, scale_, pane_focused,
+                                              IsHighContrast(), list_selection_outline_);
 
     // Rows slide into place after small inserts/removals and new rows flash
     // (ui_motion.h ListShiftMotion). Same folder, view, filter and scroll only.
@@ -2103,38 +2246,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 FillRoundedRect(dc, brFillInput_.get(), bg.left + 0.5f * scale_,
                     (bg.top + bg.bottom - bar_h) * 0.5f, 2.5f * scale_, bar_h, 1.25f * scale_);
             }
-            if (draw_shapes && selected) {
-                const D2D1_RECT_F sel = D2D1::RectF(
-                    bg.left + inset, bg.top + scale_,
-                    bg.right - inset, bg.bottom - scale_);
-                const float sel_radius = theme.radius_control * scale_;
-                const D2D1_ROUNDED_RECT sel_rr = D2D1::RoundedRect(
-                    D2D1::RectF(sel.left, sel.top, std::max(sel.left, sel.right),
-                                std::max(sel.top, sel.bottom)),
-                    sel_radius, sel_radius);
-                if (selection_gradient.get()) {
-                    selection_gradient->SetStartPoint(D2D1::Point2F(sel.left, 0.0f));
-                    selection_gradient->SetEndPoint(D2D1::Point2F(sel.right, 0.0f));
-                    dc->FillRoundedRectangle(&sel_rr, selection_gradient.get());
-                } else {
-                    dc->FillRoundedRectangle(&sel_rr, brFillSelected_.get());
-                }
-                if (list_selection_outline_ && sel.right - sel.left > 2.0f * scale_) {
-                    // Settings > File list > Outline selected items (#78).
-                    MakeBrush(dc, pane_focused ? theme.list_selected_outline
-                                               : WithAlpha(theme.text, 0.30f), brFillInput_);
-                    const float half = 0.5f * scale_;
-                    dc->DrawRoundedRectangle(D2D1::RoundedRect(
-                        D2D1::RectF(sel.left + half, sel.top + half, sel.right - half, sel.bottom - half),
-                        sel_radius, sel_radius), brFillInput_.get(), 1.0f * scale_);
-                }
-                if (pane_focused) {
-                    MakeBrush(dc, theme.accent, brAccent_);
-                    const float indicator_h = std::min(18*scale_, std::max(0.0f, sel.bottom-sel.top-8*scale_));
-                    FillRoundedRect(dc, brAccent_.get(), sel.left + scale_,
-                        (sel.top+sel.bottom-indicator_h)*0.5f, 2*scale_, indicator_h, scale_);
-                }
-            }
+            if (draw_shapes && selected) selection_painter.Selected(bg);
             if (draw_shapes && row_flash > 0.0f && !IsHighContrast()) {
                 // Newly appeared (pasted / created / extracted) row: fading accent wash.
                 MakeBrush(dc, WithAlpha(theme.accent, 0.20f * row_flash), brFillInput_);
@@ -2169,11 +2281,16 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 const float iconX = iconRect.left;
                 const float iconY = iconRect.top;
                 const float renderedIconSize = std::min(snappedIconW, snappedIconH);
+                uint32_t media_duration_ms = 0;
                 const bool drewThumbnail = !e.record_only && UsesThumbnails(vm.view_mode) &&
-                    thumbnail_cache_.DrawGridThumbnail(dc, iconRect, e.path, e.attrs,
-                        ThumbnailRequestPixels(vm.view_mode, renderedIconSize),
-                        vm.view_generation, e.modified_value, e.size_value, 1.0f, iconGrid, &artwork)
+                    DrawEntryThumbnail(dc, iconRect, e, vm.view_mode, vm.view_generation,
+                        ThumbnailRequestPixels(vm.view_mode, renderedIconSize), 1.0f, iconGrid, &artwork,
+                        &media_duration_ms)
                         == PreviewDrawResult::Bitmap;
+                // Photos and videos look alike as thumbnails: say which program
+                // opens the file, and how long a video plays (like Explorer).
+                if (drewThumbnail && thumbnail_badges_ && iconGrid && !e.is_dir && !e.is_link)
+                    DrawThumbnailBadges(e, artwork, renderedIconSize, media_duration_ms, theme);
                 if (!drewThumbnail) {
                     ID2D1Bitmap* grid_bitmap = iconGrid && !morphing && !e.record_only
                         ? icon_cache_.BitmapFor(e.path, e.name, e.is_dir, e.attrs, renderedIconSize) : nullptr;

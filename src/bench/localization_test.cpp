@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <atomic>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -108,7 +109,8 @@ int main() {
             SetLanguage(language);
             for (const auto id : {StringId::LanguageZhTW, StringId::SettingsAutoUpdate,
                                   StringId::SettingsAutoUpdateDesc, StringId::UpdateDescManual,
-                                  StringId::SettingsUiFontSize, StringId::UiFontLarger})
+                                  StringId::SettingsUiFontSize, StringId::UiFontLarger,
+                                  StringId::ListThumbnailBadges, StringId::ListThumbnailBadgesDesc})
                 newest &= !Get(id).empty();
         }
         SetLanguage(L"zh-TW");
@@ -223,10 +225,18 @@ int main() {
     passed &= Report("zh-CN service text is unchanged",
         ServiceText(L"已索引 1,234 项 · 实时更新") == L"已索引 1,234 项 · 实时更新");
 
+    struct LanguageCase { LANGID id; Language expected; };
+    constexpr LanguageCase language_cases[] = {
+        {0x0804, Language::ZhCN}, {0x1004, Language::ZhCN},
+        {0x0004, Language::ZhCN}, {0x0404, Language::ZhTW}, {0x0c04, Language::ZhTW},
+        {0x1404, Language::ZhTW}, {0x7c04, Language::ZhTW}, {0x0409, Language::EnUS},
+        {0x0809, Language::EnUS}, {0x0411, Language::EnUS}};
+    for (const auto [id, expected] : language_cases) {
+        passed &= Report("fixed Windows language ID mapping", LanguageFromLangId(id) == expected);
+    }
     SetLanguage(L"system");
-    passed &= Report("system language resolves to a shipped locale",
-                     effective_language() == Language::ZhCN ||
-                     effective_language() == Language::EnUS);
+    passed &= Report("system language follows the public Windows language mapping",
+        effective_language() == LanguageFromLangId(GetUserDefaultUILanguage()));
     std::printf("\n== localization tests: %s ==\n", passed ? "PASS" : "FAIL");
     return passed ? 0 : 1;
 }

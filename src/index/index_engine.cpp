@@ -211,9 +211,7 @@ uint64_t RootFrn(wchar_t letter) {
     return frn;
 }
 
-std::vector<VolumeInfo> ConfiguredVolumes() {
-    IndexConfig config;
-    if (MachineIndexScope()) LoadMachineConfig(config, nullptr);
+std::vector<VolumeInfo> ConfiguredVolumes(const IndexConfig& config) {
     auto volumes = EnumerateLocalVolumes(config);
     volumes.erase(std::remove_if(volumes.begin(), volumes.end(), [](const VolumeInfo& volume) {
         return !volume.enabled || !volume.online || volume.mount_point.size() < 2;
@@ -446,7 +444,14 @@ std::wstring Engine::Status() const {
 }
 
 void Engine::RequestRebuild() {
-    const auto active = ConfiguredVolumes();
+    IndexConfig config;
+    std::wstring config_error;
+    if (MachineIndexScope() && !LoadMachineConfig(config, &config_error)) {
+        SetStatus(config_error);
+        PingNotify(true);
+        return;
+    }
+    const auto active = ConfiguredVolumes(config);
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
         UpdateVolumeVisibilityLocked(active, true);
@@ -459,7 +464,7 @@ void Engine::RequestRebuild() {
 
 std::vector<VolumeInfo> Engine::Volumes() const {
     IndexConfig config;
-    if (MachineIndexScope()) LoadMachineConfig(config, nullptr);
+    if (MachineIndexScope() && !LoadMachineConfig(config, nullptr)) return {};
     auto result = EnumerateLocalVolumes(config);
     std::shared_lock<std::shared_mutex> lock(mutex_);
     for (auto& volume : result) {
@@ -3429,9 +3434,14 @@ void Engine::FullRebuild(const char* reason) {
     diagnostics::runtime::Event("index_rebuild_begin", {{"operation", operation}, {"reason", reason_code}, {"nodes", indexed_.load()}});
     const auto timing = FilenameTiming::Begin();
     DWORD build_error = ERROR_SUCCESS;
-    const auto configured_volumes = ConfiguredVolumes();
     IndexConfig config;
-    if (MachineIndexScope()) LoadMachineConfig(config, nullptr);
+    std::wstring config_error;
+    if (MachineIndexScope() && !LoadMachineConfig(config, &config_error)) {
+        SetStatus(config_error);
+        PingNotify(true);
+        return;
+    }
+    const auto configured_volumes = ConfiguredVolumes(config);
     excluded_paths_ = config.excluded_paths;
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -3600,10 +3610,16 @@ void Engine::Worker() {
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     ResolveIndexDirFrn();
     IndexConfig startup_config;
-    if (MachineIndexScope()) LoadMachineConfig(startup_config, nullptr);
+    std::wstring config_error;
+    if (MachineIndexScope() && !LoadMachineConfig(startup_config, &config_error)) {
+        SetStatus(config_error);
+        PingNotify(true);
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        return;
+    }
     excluded_paths_ = startup_config.excluded_paths;
     const bool have_cache = TryLoadCache();
-    const auto initial_drives = ConfiguredVolumes();
+    const auto initial_drives = ConfiguredVolumes(startup_config);
     bool needs_search_rebuild = false;
     {
         std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -3621,9 +3637,7 @@ void Engine::Worker() {
         }
         if (have_vols) {
             auto drives = initial_drives;
-            IndexConfig configured;
-            if (MachineIndexScope()) LoadMachineConfig(configured, nullptr);
-            const auto mounted = EnumerateLocalVolumes(configured);
+            const auto mounted = EnumerateLocalVolumes(startup_config);
             fresh = true;
             {
                 std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -3732,7 +3746,9 @@ void Engine::Worker() {
         const auto loop_tick = GetTickCount64();
         if (fixture_root_.empty() && loop_tick - topology_tick >= 30000) {
             const auto timing = FilenameTiming::Begin();
-            online = ConfiguredVolumes();
+            IndexConfig topology_config;
+            if (!MachineIndexScope() || LoadMachineConfig(topology_config, nullptr))
+                online = ConfiguredVolumes(topology_config);
             topology_tick = loop_tick;
             filename_timing_.End(FilenameStage::Topology, timing, online.size(), ERROR_SUCCESS, "periodic");
         }

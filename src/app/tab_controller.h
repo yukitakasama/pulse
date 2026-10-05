@@ -32,6 +32,8 @@ public:
     static constexpr size_t PaletteSize() noexcept { return 8; }
 
 private:
+    friend struct TabControllerTestAccess;
+    void DuplicateTab(WindowTabs& tabs, size_t index);
     TabGroup* FindGroup(WindowTabs& tabs, int id) const;
     uint32_t FirstUnusedColor(const WindowTabs& tabs) const;
     void CreateGroupAndEdit(WindowTabs& tabs, int tab_index, POINT screen_pt,

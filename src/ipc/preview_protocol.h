@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <string>
+#include "../common/preview_integrity.h"
 
 namespace pulse::ipc {
 constexpr uint32_t kPreviewMagic = 0x57565250; // PRVW
@@ -43,6 +44,10 @@ constexpr uint32_t kPreviewRequestFlagGrid = 1u << 0;
 constexpr uint32_t kPreviewRequestFlagFolderListing = 1u << 1;
 // Quick Look: rich document payloads (Markdown) instead of plain text.
 constexpr uint32_t kPreviewRequestFlagRichText = 1u << 2;
+// Isolated, low-priority folder artwork; never the ordinary folder listing.
+constexpr uint32_t kPreviewRequestFlagFolderThumbnail = 1u << 3;
+constexpr uint32_t kPreviewRequestFlagFolderRefresh = 1u << 4;
+constexpr uint32_t kPreviewRequestFlagFolderSingle = 1u << 5;
 constexpr uint32_t kPreviewMaxTextChars = 32768;
 constexpr uint32_t kPreviewMaxArchiveChars = 512u * 1024u;
 constexpr uint32_t kPreviewMaxTableChars = 2u * 1024u * 1024u;
@@ -96,6 +101,9 @@ struct PreviewResponse {
     uint32_t loop_count = 0;
     uint32_t source_width = 0;
     uint32_t source_height = 0;
+    // Grid thumbnails of videos: System.Media.Duration in ms, 0 when unknown.
+    uint32_t duration_ms = 0;
+    preview::Integrity integrity;
 };
 inline std::wstring PreviewPipeName(DWORD pid) {
     return L"\\\\.\\pipe\\PulsePreview-" + std::to_wstring(pid);

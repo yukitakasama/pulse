@@ -2725,7 +2725,8 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 // plain click; the chevron and the rest of the header fold.
                 s->groupDragNavigate = hit.sub_index == 1 &&
                     vm.sidebar[static_cast<size_t>(hit.index)].navigable;
-                s->groupDragPath.clear();
+                s->groupDragPath = s->groupDragNavigate
+                    ? vm.sidebar[static_cast<size_t>(hit.index)].navigation_path : std::wstring{};
                 s->groupDragStartPt = POINT{ mx, my };
                 s->groupDragToIndex = -1;
                 s->groupGapVisible = false;

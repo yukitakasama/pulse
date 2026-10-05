@@ -1,5 +1,6 @@
 #include "../common/windows_compat.h"
 #include "folder_picker_view.h"
+#include "folder_picker_art.h"
 
 #include "../common/display_path.h"
 #include "../common/localization.h"
@@ -38,7 +39,7 @@ Columns ColumnsFor(const D2D1_RECT_F& row, float scale, bool with_size) {
     const float right = row.right - Dip(scale, 12.0f);
     const float size_w = with_size ? Dip(scale, 84.0f) : 0.0f;
     float type_w = Dip(scale, 76.0f);
-    const float modified_w = Dip(scale, 136.0f);
+    const float modified_w = right - left - size_w < Dip(scale, 320) ? 0 : Dip(scale, 136);
     if (right - left - size_w - type_w - modified_w < Dip(scale, 180.0f)) type_w = 0.0f;
     const float type_right = right - size_w;
     const float modified_right = type_right - type_w;
@@ -99,16 +100,17 @@ void DrawDriveRow(Compositor& compositor, fluent::Painter& painter, const Theme&
     painter.DrawListRowBackground(background);
     const float left = row.left + Dip(scale, 12.0f);
     const float right = row.right - Dip(scale, 12.0f);
+    const bool compact = right - left < Dip(scale, 500);
     const float detail_left = right - Dip(scale, 176.0f);
     const float bar_left = std::max(left + Dip(scale, 160.0f), detail_left - Dip(scale, 128.0f));
     painter.DrawGlyph(L"\xE7F1", D2D1::RectF(left, row.top, left + Dip(scale, 20.0f),
                                            row.bottom),
                       secondary);
     DrawFittedText(compositor, painter, entry.name,
-                   D2D1::RectF(left + Dip(scale, 28.0f), row.top, bar_left - Dip(scale, 8.0f),
+                   D2D1::RectF(left + Dip(scale, 28.0f), row.top, (compact ? right : bar_left - Dip(scale, 8.0f)),
                                row.bottom),
                    compositor.TextFormat(), text);
-    if (entry.size == 0) return;
+    if (entry.size == 0 || compact) return;
     const float used = 1.0f - static_cast<float>(static_cast<double>(entry.free) /
                                                  static_cast<double>(entry.size));
     const float mid = (row.top + row.bottom) * 0.5f;
@@ -124,10 +126,28 @@ void DrawDriveRow(Compositor& compositor, fluent::Painter& painter, const Theme&
                      fluent::HorizontalAlignment::Right);
 }
 
+void DrawPickerIcon(fluent::Painter& painter, const Theme& theme, const PickerEntry& entry,
+                    const D2D1_RECT_F& rect, bool high_contrast, FolderPickerArt* art,
+                    ID2D1DeviceContext* dc, bool thumbnail) {
+    if (art && art->Draw(dc, entry, rect, thumbnail && !high_contrast)) return;
+    // Quiet geometric placeholder while the native type icon arrives.
+    const float size = rect.right - rect.left;
+    const bool folder = entry.kind == PickerEntryKind::Folder || entry.kind == PickerEntryKind::Drive;
+    const auto color = high_contrast ? theme.text : folder ? theme.icon_folder : theme.icon_file;
+    if (folder) {
+        painter.FillRoundedRect(D2D1::RectF(rect.left, rect.top + size * .18f, rect.left + size * .46f, rect.top + size * .40f), size * .06f, color);
+        painter.FillRoundedRect(D2D1::RectF(rect.left, rect.top + size * .30f, rect.right, rect.bottom - size * .12f), size * .07f, color);
+    } else {
+        painter.StrokeRoundedRect(D2D1::RectF(rect.left + size * .20f, rect.top + size * .06f, rect.right - size * .20f, rect.bottom - size * .06f), size * .05f, color, std::max(1.0f, size * .04f));
+        for (int line = 0; line < 3; ++line) painter.FillRoundedRect(
+            D2D1::RectF(rect.left + size * .32f, rect.top + size * (.38f + line * .15f), rect.right - size * .32f, rect.top + size * (.42f + line * .15f)), 0, color);
+    }
+}
+
 void DrawEntryRow(Compositor& compositor, fluent::Painter& painter, const Theme& theme,
                   const PickerEntry& entry, const D2D1_RECT_F& row,
                   const fluent::ControlState& state, bool with_size, bool high_contrast,
-                  float scale) {
+                  float scale, FolderPickerArt* art) {
     fluent::ListRowSpec background{};
     background.bounds = row;
     background.state = state;
@@ -136,15 +156,15 @@ void DrawEntryRow(Compositor& compositor, fluent::Painter& painter, const Theme&
     const bool inverse = InverseRow(state, high_contrast);
     const D2D1_COLOR_F text = inverse ? theme.bg : theme.text;
     const D2D1_COLOR_F secondary = inverse ? theme.bg : theme.text_secondary;
-    const bool folder = entry.kind == PickerEntryKind::Folder;
-    painter.DrawGlyph(folder ? L"\xE8B7" : L"\xEB9F",
-                      D2D1::RectF(c.left, row.top, c.left + Dip(scale, 20.0f), row.bottom),
-                      high_contrast ? text : folder ? theme.icon_folder : theme.icon_file);
+    DrawPickerIcon(painter, theme, entry,
+        D2D1::RectF(c.left, row.top + (row.bottom - row.top - Dip(scale, 20)) * 0.5f,
+            c.left + Dip(scale, 20), row.top + (row.bottom - row.top + Dip(scale, 20)) * 0.5f),
+        high_contrast, art, compositor.Dc(), false);
     DrawFittedText(compositor, painter, entry.name,
                    D2D1::RectF(c.left + Dip(scale, 28.0f), row.top,
                                c.name_right - Dip(scale, 8.0f), row.bottom),
                    compositor.TextFormat(), text);
-    painter.DrawText(format::LocalFileTime(entry.modified),
+    if (c.modified_right > c.name_right) painter.DrawText(format::LocalFileTime(entry.modified),
                      D2D1::RectF(c.name_right + Dip(scale, 8.0f), row.top,
                                  c.modified_right - Dip(scale, 4.0f), row.bottom),
                      compositor.SmallFormat(), secondary);
@@ -154,7 +174,7 @@ void DrawEntryRow(Compositor& compositor, fluent::Painter& painter, const Theme&
                                                       row.bottom),
                          compositor.SmallFormat(), secondary);
     }
-    if (with_size && entry.kind == PickerEntryKind::Image) {
+    if (with_size && entry.kind != PickerEntryKind::Folder) {
         painter.DrawText(format::ByteSize(entry.size),
                          D2D1::RectF(c.type_right + Dip(scale, 8.0f), row.top, c.right,
                                      row.bottom),
@@ -169,8 +189,9 @@ FolderPickerLayout LayoutFolderPicker(float width, float height,
                                       const std::vector<PickerPlace>& places,
                                       const fluent::Painter& painter,
                                       const std::wstring& primary_text,
-                                      const std::wstring& cancel_text, float scale) {
+                                      const std::wstring& cancel_text, float scale, PickerViewMode view, bool file_mode) {
     FolderPickerLayout l;
+    l.scale = scale;
     l.width = width;
     l.height = height;
     l.title_bar = Dip(scale, kTitleBar);
@@ -180,13 +201,21 @@ FolderPickerLayout LayoutFolderPicker(float width, float height,
     const float ty = Dip(scale, kToolbarTop);
     const float th = Dip(scale, kToolbarH);
     l.back = D2D1::RectF(Dip(scale, 12.0f), ty, Dip(scale, 12.0f) + th, ty + th);
-    l.up = D2D1::RectF(l.back.right + Dip(scale, 4.0f), ty,
-                       l.back.right + Dip(scale, 4.0f) + th, ty + th);
-    l.path = D2D1::RectF(l.up.right + Dip(scale, 8.0f), ty, width - Dip(scale, 16.0f), ty + th);
+    l.forward = D2D1::RectF(l.back.right + Dip(scale, 4), ty, l.back.right + Dip(scale, 4) + th, ty + th);
+    l.up = D2D1::RectF(l.forward.right + Dip(scale, 4.0f), ty,
+                       l.forward.right + Dip(scale, 4.0f) + th, ty + th);
+    l.path = D2D1::RectF(l.up.right + Dip(scale, 8.0f), ty, width - Dip(scale, 58.0f), ty + th);
+    l.refresh = D2D1::RectF(width - Dip(scale, 50), ty, width - Dip(scale, 16), ty + th);
 
-    const float body_top = ty + th + Dip(scale, 12.0f);
-    const float footer_top = height - Dip(scale, kFooterH);
-    l.sidebar = D2D1::RectF(Dip(scale, 8.0f), body_top, Dip(scale, 8.0f + kSidebarW),
+    const float tool_y = ty + th + Dip(scale, 8);
+    l.search = D2D1::RectF(Dip(scale, 16), tool_y, width - Dip(scale, 188), tool_y + th);
+    l.sort = D2D1::RectF(width - Dip(scale, 180), tool_y, width - Dip(scale, 146), tool_y + th);
+    l.view_button = D2D1::RectF(width - Dip(scale, 138), tool_y, width - Dip(scale, 104), tool_y + th);
+    l.hidden_button = D2D1::RectF(width - Dip(scale, 96), tool_y, width - Dip(scale, 62), tool_y + th);
+    l.new_folder = D2D1::RectF(width - Dip(scale, 54), tool_y, width - Dip(scale, 20), tool_y + th);
+    const float body_top = tool_y + th + Dip(scale, 12);
+    const float footer_top = height - Dip(scale, file_mode ? 112.0f : kFooterH);
+    l.sidebar = D2D1::RectF(Dip(scale, 8.0f), body_top, Dip(scale, width / scale < 760 ? 156.0f : 8.0f + kSidebarW),
                             footer_top - Dip(scale, 8.0f));
     float y = body_top + Dip(scale, 26.0f);  // room for the section label
     for (const PickerPlace& place : places) {
@@ -204,9 +233,21 @@ FolderPickerLayout LayoutFolderPicker(float width, float height,
     l.rows = D2D1::RectF(l.card.left + Dip(scale, 4.0f), l.header.bottom + Dip(scale, 2.0f),
                          l.card.right - Dip(scale, 4.0f), l.card.bottom - Dip(scale, 4.0f));
 
+    if (view != PickerViewMode::Details) {
+        l.header.bottom = l.header.top;
+        l.rows.top = l.card.top + Dip(scale, 8);
+        l.row_h = Dip(scale, view == PickerViewMode::MediumIcons ? 104.0f : 156.0f);
+        l.columns = std::max(1, static_cast<int>((l.rows.right - l.rows.left - Dip(scale, 8)) /
+                             Dip(scale, view == PickerViewMode::MediumIcons ? 100.0f : 136.0f)));
+    }
+    if (file_mode) {
+        const float fy = footer_top + Dip(scale, 12);
+        l.filename = D2D1::RectF(Dip(scale, 20), fy, width * 0.62f, fy + th);
+        l.filter = D2D1::RectF(l.filename.right + Dip(scale, 10), fy, width - Dip(scale, 20), fy + th);
+    }
     l.footer = D2D1::RectF(0, footer_top, width, height);
     const float btn_h = painter.MeasureButtonHeight();
-    const float by = footer_top + (Dip(scale, kFooterH) - btn_h) * 0.5f;
+    const float by = height - Dip(scale, kFooterH) + (Dip(scale, kFooterH) - btn_h) * 0.5f;
     const float primary_w = std::max(painter.MeasureButtonWidth(primary_text),
                                      Dip(scale, kButtonMinW));
     const float cancel_w = std::max(painter.MeasureButtonWidth(cancel_text),
@@ -215,13 +256,13 @@ FolderPickerLayout LayoutFolderPicker(float width, float height,
     l.primary = D2D1::RectF(right - primary_w, by, right, by + btn_h);
     l.cancel = D2D1::RectF(l.primary.left - Dip(scale, 8.0f) - cancel_w, by,
                            l.primary.left - Dip(scale, 8.0f), by + btn_h);
-    l.summary = D2D1::RectF(Dip(scale, 20.0f), footer_top, l.cancel.left - Dip(scale, 16.0f),
+    l.summary = D2D1::RectF(Dip(scale, 20.0f), height - Dip(scale, kFooterH), l.cancel.left - Dip(scale, 16.0f),
                             height);
     return l;
 }
 
 float PickerContentHeight(const FolderPickerLayout& layout, size_t count) {
-    return layout.row_h * static_cast<float>(count);
+    return layout.row_h * static_cast<float>((count + layout.columns - 1) / layout.columns);
 }
 
 float ClampPickerScroll(const FolderPickerLayout& layout, size_t count, float scroll) {
@@ -234,7 +275,7 @@ float ScrollPickerRowIntoView(const FolderPickerLayout& layout, size_t count, fl
                               int index) {
     if (index < 0) return ClampPickerScroll(layout, count, scroll);
     const float viewport = layout.rows.bottom - layout.rows.top;
-    const float top = layout.row_h * static_cast<float>(index);
+    const float top = layout.row_h * static_cast<float>(index / layout.columns);
     if (top < scroll) scroll = top;
     else if (top + layout.row_h > scroll + viewport) scroll = top + layout.row_h - viewport;
     return ClampPickerScroll(layout, count, scroll);
@@ -242,11 +283,16 @@ float ScrollPickerRowIntoView(const FolderPickerLayout& layout, size_t count, fl
 
 int HitTestFolderPicker(const FolderPickerLayout& l, const FolderPickerVisual& v,
                         float x, float y) {
+    const std::pair<D2D1_RECT_F, int> controls[] = {
+        {l.forward, v.can_forward ? kPickForward : kPickNone}, {l.refresh, kPickRefresh},
+        {l.view_button, kPickView}, {l.hidden_button, kPickHidden}, {l.filename, kPickFilename},
+        {l.filter, kPickFilter}, {l.search, kPickSearch}, {l.sort, kPickSort}, {l.new_folder, v.current.empty() || v.waiting || v.validating ? kPickNone : kPickNewFolder}};
+    for (const auto& control : controls) if (ContainsRect(control.first, x, y)) return control.second;
     if (ContainsRect(l.close, x, y)) return kPickClose;
     if (ContainsRect(l.back, x, y)) return v.can_back ? kPickBack : kPickNone;
     if (ContainsRect(l.up, x, y)) return v.can_up ? kPickUp : kPickNone;
     if (ContainsRect(l.path, x, y)) return kPickPath;
-    if (ContainsRect(l.primary, x, y)) return v.chosen.empty() ? kPickNone : kPickPrimary;
+    if (ContainsRect(l.primary, x, y)) return v.waiting || v.validating || (v.chosen.empty() && v.filename_text.empty()) ? kPickNone : kPickPrimary;
     if (ContainsRect(l.cancel, x, y)) return kPickCancel;
     for (size_t i = 0; i < l.places.size(); ++i) {
         if (ContainsRect(l.places[i], x, y)) return kPickPlace + static_cast<int>(i);
@@ -254,9 +300,11 @@ int HitTestFolderPicker(const FolderPickerLayout& l, const FolderPickerVisual& v
     if (ContainsRect(l.rows, x, y)) {
         const float viewport = l.rows.bottom - l.rows.top;
         if (PickerContentHeight(l, v.entries.size()) > viewport &&
-            x >= l.rows.right - 12.0f * (l.row_h / kRowH))
+            x >= l.rows.right - 12.0f * l.scale)
             return kPickScrollbar;
-        const int index = static_cast<int>(std::floor((y - l.rows.top + v.scroll) / l.row_h));
+        const float cell_w = (l.rows.right - l.rows.left - 8.0f * l.scale) / l.columns;
+        const int column = std::min(l.columns - 1, static_cast<int>((x - l.rows.left) / cell_w));
+        const int index = static_cast<int>(std::floor((y - l.rows.top + v.scroll) / l.row_h)) * l.columns + column;
         if (index >= 0 && index < static_cast<int>(v.entries.size())) return kPickRow + index;
         return kPickList;
     }
@@ -266,7 +314,7 @@ int HitTestFolderPicker(const FolderPickerLayout& l, const FolderPickerVisual& v
 
 void DrawFolderPicker(Compositor& compositor, fluent::Painter& painter, const Theme& theme,
                       const FolderPickerVisual& v, const FolderPickerLayout& l,
-                      bool /*dark*/, bool high_contrast) {
+                      bool /*dark*/, bool high_contrast, FolderPickerArt* art) {
     const float scale = painter.Scale();
     auto* dc = compositor.Dc();
 
@@ -301,6 +349,22 @@ void DrawFolderPicker(Compositor& compositor, fluent::Painter& painter, const Th
                          compositor.TextFormat(), theme.text);
     }
 
+    auto icon_button = [&](const D2D1_RECT_F& rect, int id, const wchar_t* glyph, bool enabled = true) {
+        fluent::ButtonSpec spec{rect, {}, glyph, fluent::ButtonKind::Transparent, StateFor(v, id, enabled)};
+        spec.icon_only = true;
+        if (id == kPickHidden) spec.state.selected = v.show_hidden;
+        painter.DrawButton(spec);
+    };
+    icon_button(l.forward, kPickForward, L"\xE72A", v.can_forward);
+    icon_button(l.refresh, kPickRefresh, L"\xE72C");
+    icon_button(l.sort, kPickSort, L"\xE8CB");
+    icon_button(l.view_button, kPickView, L"\xE80A");
+    icon_button(l.hidden_button, kPickHidden, L"\xE890");
+    icon_button(l.new_folder, kPickNewFolder, L"\xE8F4", !v.current.empty() && !v.waiting && !v.validating);
+    painter.DrawTextFieldFrame(l.search, StateFor(v, kPickSearch), v.hosted_edit);
+    if (!v.hosted_edit) DrawFittedText(compositor, painter, v.search_text.empty() ? (l10n::IsChinese() ? L"搜索" : L"Search") : v.search_text,
+        D2D1::RectF(l.search.left + Dip(scale, 12), l.search.top, l.search.right - Dip(scale, 12), l.search.bottom),
+        compositor.TextFormat(), theme.text_secondary);
     // Sidebar.
     painter.DrawText(l10n::Get(l10n::StringId::PickerQuickAccess),
                      D2D1::RectF(l.sidebar.left + Dip(scale, 12.0f), l.sidebar.top,
@@ -322,8 +386,8 @@ void DrawFolderPicker(Compositor& compositor, fluent::Painter& painter, const Th
     const float radius = Dip(scale, theme.radius_control);
     painter.FillRoundedRect(l.card, radius, theme.surface_card);
     painter.StrokeRoundedRect(l.card, radius, theme.stroke_card);
-    {
-        const bool with_size = v.mode == PickerMode::Image;
+    if (v.view == PickerViewMode::Details) {
+        const bool with_size = v.mode != PickerMode::Folder;
         // Same span as the rows, which leave room for the scrollbar.
         const Columns c = ColumnsFor(D2D1::RectF(l.rows.left, l.header.top,
                                                  l.rows.right - Dip(scale, 8.0f),
@@ -342,7 +406,7 @@ void DrawFolderPicker(Compositor& compositor, fluent::Painter& painter, const Th
         header(l10n::StringId::ColumnName, l.header.left,
                drives ? l.header.right : c.name_right, left);
         if (!drives) {
-            header(l10n::StringId::ColumnModified, c.name_right, c.modified_right, left);
+            if (c.modified_right > c.name_right) header(l10n::StringId::ColumnModified, c.name_right, c.modified_right, left);
             if (c.type_right > c.modified_right)
                 header(l10n::StringId::ColumnType, c.modified_right, c.type_right, left);
             if (with_size)
@@ -390,25 +454,41 @@ void DrawFolderPicker(Compositor& compositor, fluent::Painter& painter, const Th
                                       : l10n::StringId::PickerNoFolders);
         empty.message = l10n::Get(image ? l10n::StringId::PickerNoImagesDesc
                                         : l10n::StringId::PickerNoFoldersDesc);
+        if (v.mode == PickerMode::File) {
+            empty.title = l10n::IsChinese() ? L"没有匹配的文件" : L"No matching files";
+            empty.message = l10n::IsChinese() ? L"尝试其他搜索词或文件类型。" : L"Try another search or file type.";
+        }
         painter.DrawEmptyState(empty);
     } else if (dc) {
         dc->PushAxisAlignedClip(rows, D2D1_ANTIALIAS_MODE_ALIASED);
-        const int first = std::max(0, static_cast<int>(std::floor(v.scroll / l.row_h)));
+        const int first = std::max(0, static_cast<int>(std::floor(v.scroll / l.row_h))) * l.columns;
         const int count = static_cast<int>(v.entries.size());
         for (int i = first; i < count; ++i) {
-            const float top = rows.top + l.row_h * static_cast<float>(i) - v.scroll;
+            const float top = rows.top + l.row_h * static_cast<float>(i / l.columns) - v.scroll;
             if (top >= rows.bottom) break;
-            const D2D1_RECT_F row = D2D1::RectF(rows.left, top, rows.right - Dip(scale, 8.0f),
-                                                top + l.row_h);
+            const float cell_w = (rows.right - rows.left - Dip(scale, 8)) / l.columns;
+            const float cell_x = rows.left + cell_w * (i % l.columns);
+            const D2D1_RECT_F row = D2D1::RectF(cell_x, top, cell_x + cell_w, top + l.row_h);
             const PickerEntry& entry = v.entries[static_cast<size_t>(i)];
             fluent::ControlState state = StateFor(v, kPickRow + i);
-            state.selected = i == v.selected;
+            state.selected = v.selected_indices.empty() && v.mode != PickerMode::File ? i == v.selected :
+                std::find(v.selected_indices.begin(), v.selected_indices.end(), i) != v.selected_indices.end();
             state.keyboard_focus = false;
-            if (entry.kind == PickerEntryKind::Drive) {
+            if (v.view != PickerViewMode::Details) {
+                fluent::ListRowSpec bg{}; bg.bounds = row; bg.state = state;
+                painter.DrawListRowBackground(bg);
+                const float edge = Dip(scale, v.view == PickerViewMode::MediumIcons ? 56.0f : 96.0f);
+                const float ix = (row.left + row.right - edge) * 0.5f;
+                const auto icon = D2D1::RectF(ix, row.top + Dip(scale, 8), ix + edge, row.top + Dip(scale, 8) + edge);
+                DrawPickerIcon(painter, theme, entry, icon, high_contrast, art, dc, true);
+                DrawFittedText(compositor, painter, entry.name,
+                    D2D1::RectF(row.left + Dip(scale, 6), icon.bottom + Dip(scale, 4), row.right - Dip(scale, 6), row.bottom - Dip(scale, 6)),
+                    compositor.TextFormat(), InverseRow(state, high_contrast) ? theme.bg : theme.text);
+            } else if (entry.kind == PickerEntryKind::Drive) {
                 DrawDriveRow(compositor, painter, theme, entry, row, state, high_contrast, scale);
             } else {
                 DrawEntryRow(compositor, painter, theme, entry, row, state,
-                             v.mode == PickerMode::Image, high_contrast, scale);
+                             v.mode != PickerMode::Folder, high_contrast, scale, art);
             }
             if (i == v.selected && v.show_focus && v.focus == kPickList)
                 painter.DrawFocusRing(row, radius);
@@ -443,15 +523,25 @@ void DrawFolderPicker(Compositor& compositor, fluent::Painter& painter, const Th
     } else if (v.mode == PickerMode::Image) {
         summary = l10n::Get(l10n::StringId::PickerPickImageHint);
     }
-    painter.DrawText(summary, l.summary, compositor.TextFormat(), theme.text_secondary,
+    if (l.filename.right > l.filename.left) {
+        painter.DrawTextFieldFrame(l.filename, StateFor(v, kPickFilename), v.hosted_edit);
+        painter.DrawButton({l.filter, v.filter_text.empty() ? (l10n::IsChinese() ? L"所有文件 (*.*)" : L"All files (*.*)") : v.filter_text, L"\xE70D",
+            fluent::ButtonKind::Standard, StateFor(v, kPickFilter)});
+        if (!v.hosted_edit) DrawFittedText(compositor, painter, v.filename_text,
+            D2D1::RectF(l.filename.left + Dip(scale, 10), l.filename.top, l.filename.right - Dip(scale, 10), l.filename.bottom),
+            compositor.TextFormat(), theme.text);
+    }
+    if (!v.notice.empty()) summary = FitTextEnd(v.notice, l.summary.right - l.summary.left,
+        [&](std::wstring_view text) { return typography::MeasureLine(&compositor, compositor.TextFormat(), text); });
+    painter.DrawText(summary, l.summary, compositor.TextFormat(), v.notice.empty() ? theme.text_secondary : theme.danger,
                      fluent::HorizontalAlignment::Left, theme.surface_sheet);
     painter.DrawButton({l.cancel, v.cancel_text, {}, fluent::ButtonKind::Standard,
                         StateFor(v, kPickCancel)});
     painter.DrawButton({l.primary, v.primary_text, {}, fluent::ButtonKind::Primary,
-                        StateFor(v, kPickPrimary, !v.chosen.empty())});
+                        StateFor(v, kPickPrimary, !v.waiting && !v.validating && (!v.chosen.empty() || !v.filename_text.empty()))});
     // The shared accent ring vanishes against a filled button; add the Fluent
     // outer ring in the text colour.
-    if (StateFor(v, kPickPrimary, !v.chosen.empty()).keyboard_focus) {
+    if (StateFor(v, kPickPrimary, !v.waiting && !v.validating && (!v.chosen.empty() || !v.filename_text.empty())).keyboard_focus) {
         const float gap = Dip(scale, 3.0f);
         painter.StrokeRoundedRect(D2D1::RectF(l.primary.left - gap, l.primary.top - gap,
                                               l.primary.right + gap, l.primary.bottom + gap),

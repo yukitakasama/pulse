@@ -8,6 +8,7 @@ bool SubmitWithConflictResolution(AppState& s, ops::OpRequest request);
 void ReleaseTrayBatch(AppState& s, size_t idx);
 void PasteIntoCurrent(AppState& s);
 void DeleteSelected(AppState& s, bool permanent);
+void DeletePaths(AppState& s, std::vector<std::wstring> paths, bool permanent);
 // Confirmation shown before Delete moves items to the Recycle Bin (opt-in setting).
 ui::ConfirmDialogSpec BuildRecycleDeleteConfirm(const std::vector<std::wstring>& paths);
 void RestoreSelected(AppState& s);
@@ -15,6 +16,7 @@ void RestoreSelected(AppState& s);
 void RestoreAllRecycle(AppState& s);
 void EmptyRecycleBin(AppState& s);
 void CollectToTray(AppState& s, bool move_intent);
+void CollectPathsToTray(AppState& s, const std::vector<std::wstring>& paths, bool move_intent);
 void ShowBatchRename(AppState& s);
 // Staging tray recent drop destinations (appPrefs.tray_dests, newest first, max 3).
 std::vector<std::wstring> TrayDestList(const AppState& s);

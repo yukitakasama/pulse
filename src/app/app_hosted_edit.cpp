@@ -143,19 +143,7 @@ void LayoutAddressEditor(AppState& s) {
 }
 
 void EnsureEditVisuals(AppState& s) {
-    if (!s.editFont) {
-        const int height = -std::max(1, static_cast<int>(std::lround(
-            14.0f * ui::typography::UiFontScale() * s.scale)));
-        const wchar_t* family = ui::typography::PreferredTextFamily();
-        s.editFont = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, family);
-        if (!s.editFont) {
-            s.editFont = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        }
-    }
+    if (!s.editFont) s.editFont = ui::typography::CreateEditFont(s.scale);
     if (!s.editBrush) {
         s.editBrush = CreateSolidBrush(s.darkMode ? RGB(30, 30, 30) : RGB(255, 255, 255));
     }

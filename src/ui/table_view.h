@@ -24,6 +24,13 @@ public:
     void Clear();
     bool HasData() const noexcept { return !sheets_.empty(); }
     bool IsSpreadsheet() const noexcept { return spreadsheet_; }
+    size_t SelectedSheetIndex() const noexcept { return sheet_; }
+    bool IsSheetRequestPending() const noexcept { return awaiting_sheet_; }
+    // A sheet switch queues at most one request; rapid switches replace it.
+    // The owner sends this index to the preview host and applies its response
+    // with SetPayload. Clear() must be called when changing the source file.
+    bool TakePendingSheetRequest(uint32_t& index);
+    void FailPendingSheetRequest(uint32_t index);
     const std::wstring& Source() const noexcept { return source_; }
     // Cells of the current sheet joined by tabs, rows by newlines: what find
     // works on. Offsets below index this text.
@@ -101,7 +108,10 @@ private:
     std::vector<Sheet> sheets_;
     std::vector<uint32_t> row_offsets_;  // plain_ offset of each cells[] row
     size_t sheet_ = 0;
+    size_t response_sheet_ = 0;
+    size_t total_sheets_ = 0, loaded_sheets_ = 0;
     bool spreadsheet_ = false;
+    bool lazy_sheets_ = false, awaiting_sheet_ = false, pending_sheet_request_ = false;
 
     // Selection in body rows / columns (anchor and focus corners).
     bool sel_valid_ = false;
@@ -116,6 +126,7 @@ private:
     bool tip_shown_ = false;
     float tip_x_ = 0.0f, tip_y_ = 0.0f;
     std::vector<D2D1_RECT_F> tab_rects_;
+    D2D1_RECT_F previous_sheet_{}, next_sheet_{};
     D2D1_RECT_F vthumb_{}, hthumb_{};
 
     D2D1_RECT_F view_{};

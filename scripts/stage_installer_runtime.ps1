@@ -24,7 +24,7 @@ Get-ChildItem -LiteralPath $crt.FullName -Filter '*.dll' -File | ForEach-Object 
 $pending = [Collections.Generic.Queue[string]]::new()
 # Keep in sync with the application payload in installer/PulseSetup.iss.
 foreach ($binary in @('pulse.exe', 'Pulse.Index.exe', 'Pulse.Document.exe',
-                      'Pulse.Preview.exe', 'pulse_shell.exe', 'pulse_integration.exe', 'lumatext.dll', 'pdfium.dll')) {
+                      'Pulse.Preview.exe', 'pulse_shell.exe', 'pulse_elevated.exe', 'pulse_integration.exe', 'lumatext.dll', 'pdfium.dll')) {
     $pending.Enqueue((Join-Path $BuildDir $binary))
 }
 $required = @{}

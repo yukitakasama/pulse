@@ -5,7 +5,7 @@
 //       and 150% scale into out_dir (default build-dialog-verify).
 //   pulse_dialog_gallery.exe --live <kind> [--dark] [--init <path>] [--out <file>]
 //       Opens the real window. kind: confirm-warning, confirm-danger,
-//       confirm-three, confirm-items, picker-folder, picker-image. The choice
+//       confirm-three, confirm-items, picker-folder, picker-image, picker-file. The choice
 //       or picked path is written to --out (UTF-8).
 
 #include "../common/windows_compat.h"
@@ -377,6 +377,23 @@ int RunLive(const std::wstring& kind, bool dark, const std::wstring& init,
             return 0;
         }
         return 5;
+    }
+    if (kind == L"picker-file") {
+        FolderPickerSpec spec;
+        spec.mode = PickerMode::File;
+        spec.initial_path = init;
+        spec.allow_multiselect = true;
+        spec.filters = {{L"All files", L"*.*"}, {L"Text files", L"*.txt;*.md"},
+                        {L"Images", L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"}};
+        FilePickerResult result;
+        const bool picked = ShowFilePicker(nullptr, spec, dark, accent, result);
+        std::wstring text = picked ? L"picked:" : L"cancel";
+        for (size_t i = 0; i < result.paths.size(); ++i) {
+            if (i) text += L"\n";
+            text += result.paths[i];
+        }
+        WriteResult(out, text);
+        return 0;
     }
     if (kind == L"picker-folder" || kind == L"picker-image") {
         FolderPickerSpec spec;

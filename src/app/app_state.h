@@ -1,5 +1,6 @@
 // app_state.h — Window process state, shot request, and WM_APP message ids.
 #pragma once
+#include "../common/path_utils.h"
 
 #include "../ui/ui_compositor.h"
 #include "../ui/notification_toast.h"
@@ -8,6 +9,8 @@
 #include "../ui/drag_drop.h"
 #include "../ui/file_operation_dialog.h"
 #include "../ui/quick_preview_window.h"
+#include "list_type_ahead.h"
+#include "preview_selection_follow.h"
 #include "../ui/text_diff_window.h"
 #include "../ui/bloom_accent_picker.h"
 #include "../fs/fs_enum.h"
@@ -15,6 +18,7 @@
 #include "../fs/fs_snapshot.h"
 #include "../fs/fs_watch.h"
 #include "app_model.h"
+#include "live_network_search.h"
 #include "frame_pump.h"
 #include <deque>
 #include <atomic>
@@ -23,6 +27,7 @@
 #include "content_results_ui.h"
 #include "app_worker.h"
 #include "places.h"
+#include "app_network_locations.h"
 #include "details_meta.h"
 #include "folder_sizes.h"
 #include "context_menu_prefs.h"
@@ -85,7 +90,7 @@ constexpr UINT WM_CONTENT_SELECTION = WM_APP + 64;
 constexpr UINT WM_DUPLICATE_SCAN = WM_APP + 58;
 constexpr UINT WM_QUICK_PREVIEW_NAVIGATE = WM_APP + 54;
 constexpr UINT WM_QUICK_PREVIEW_OPEN = WM_APP + 55;
-constexpr UINT WM_QUICK_PREVIEW_COMMAND = WM_APP + 65;  // wParam ui::QuickPreviewAction, lParam bit0 = Shift
+constexpr UINT WM_QUICK_PREVIEW_COMMAND = WM_APP + 65;  // lParam: immutable command token
 constexpr UINT WM_SHOW_RELEASE_NOTES = WM_APP + 66;  // "updated" toast clicked
 constexpr UINT WM_UPDATE_RESULT = WM_APP + 56;
 constexpr UINT WM_RECYCLE_INFO = WM_APP + 57;
@@ -101,6 +106,8 @@ constexpr UINT WM_NETWORK_LIVE_SEARCH = WM_APP + 71;  // shared_ptr<LiveNetworkS
 constexpr UINT WM_SHELL_VERB_SEED = WM_APP + 70;
 constexpr UINT WM_EXIT_PULSE = WM_APP + 72;  // palette "Exit Pulse" (#57)  // ShellVerbSeed* (machine verb cache read off the UI thread)
 constexpr UINT kTimerUi = 1;
+constexpr UINT WM_NETWORK_LOCATIONS = WM_APP + 73;
+constexpr UINT WM_ASSOC_CHANGED = WM_APP + 74;  // SHCNE_ASSOCCHANGED: default programs changed
 
 enum class OmnibarMode { Path, Mixed, Command, Project };
 
@@ -154,17 +161,7 @@ struct TrayTextProbe {
     std::atomic<int> state{0}; // 0 running, 1 both text, 2 binary / unreadable
 };
 
-// #74: live walk of an unindexed network search scope. Reused for later pages
-// and re-sorts of the same query; F5 or a finished file operation drops it.
-struct LiveNetworkSearch {
-    std::wstring key;
-    std::wstring folder;
-    std::mutex mutex;
-    index::LiveNetworkMatches matches;  // guarded by mutex
-    std::atomic<bool> cancel{false};
-    std::atomic<uint32_t> latest_id{0};  // newest request answered from this walk
-};
-
+struct SidebarRefreshLoad;
 struct AppState {
     HWND hwnd = nullptr;
     ui::Compositor compositor;
@@ -177,6 +174,10 @@ struct AppState {
     // it; SyncQuickPreview re-anchors there once the listing drops the entry
     // so the preview steps to the neighbouring file instead of closing.
     int quickPreviewAnchorView = -1;
+    app::PreviewSelectionFollow quickPreviewSelection;
+    app::ListTypeAhead listTypeAhead;
+    const app::Tab* listTypeAheadTab = nullptr;
+    std::wstring listTypeAheadFolder;
 
     app::WindowTabs window_tabs;
     app::Pane* pane = nullptr;          // focused leaf of the current layout tab
@@ -201,6 +202,8 @@ struct AppState {
     ULONGLONG last_unc_poll = 0;
 
     app::SidebarModel sidebar;
+    std::shared_ptr<SidebarRefreshLoad> sidebarRefresh;
+    std::shared_ptr<NetworkLocationLoad> networkLocations;
     fs::RecycleBinInfo recycle_info;
     // SHQueryRecycleBin and $I files lag IFileOperation; retry occupancy/list
     // after recycle mutations and ignore occupancy that still matches the
@@ -278,7 +281,7 @@ struct AppState {
         std::wstring live_network_root;  // #74: scope walked live instead of the network index
     };
     std::unordered_map<uint32_t, PendingIndexSearch> pendingIndexSearches;
-    std::shared_ptr<LiveNetworkSearch> liveNetworkSearch;
+    LiveNetworkSearchSessions liveNetworkSearches;
     std::vector<index::Hit> paletteHits;
     size_t paletteTotal = 0;
     std::wstring paletteQuery;
@@ -798,9 +801,7 @@ inline AppState* GetAppState(HWND hwnd) {
 }
 
 inline std::wstring ClipboardPath(const std::wstring& p) {
-    if (p.starts_with(L"\\\\?\\UNC\\")) return L"\\\\" + p.substr(8);
-    if (p.starts_with(L"\\\\?\\")) return p.substr(4);
-    return p;
+    return path::StripExtendedPathPrefix(p);
 }
 
 } // namespace pulse

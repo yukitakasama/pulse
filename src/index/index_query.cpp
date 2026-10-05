@@ -637,6 +637,50 @@ bool QueryHasFolderFilter(const CompiledQuery& q) {
     return false;
 }
 
+bool MatchTerm(std::wstring_view path, std::wstring_view name, bool is_dir,
+               uint64_t size, uint64_t modified, const Term& term) {
+    if (term.folder && !is_dir) return false;
+    if (term.file && is_dir) return false;
+    if (!term.exts.empty()) {
+        bool ok = MatchExt(name.data(), static_cast<uint32_t>(name.size()), term);
+        if (term.ext_not) ok = !ok;
+        if (!ok) return false;
+    }
+    if (term.size_how != SizeHow::Any) {
+        bool ok = MatchSize(size, term);
+        if (term.size_not) ok = !ok;
+        if (!ok) return false;
+    }
+    if (term.date_how != DateHow::Any) {
+        bool ok = modified && MatchDate(modified, term);
+        if (term.date_not) ok = !ok;
+        if (!ok) return false;
+    }
+    if (term.name_how != NameHow::Any) {
+        bool ok = false;
+        if (!term.name_in_path) {
+            ok = MatchName(name.data(), static_cast<uint32_t>(name.size()), term);
+        } else if (term.name_how == NameHow::Wildcard) {
+            ok = WildcardFolded(path.data(), static_cast<uint32_t>(path.size()), term.name);
+        } else {
+            size_t begin = 0;
+            while (begin < path.size()) {
+                const size_t end = path.find_first_of(L"\\/", begin);
+                const size_t length = (end == std::wstring_view::npos ? path.size() : end) - begin;
+                if (length && MatchName(path.data() + begin, static_cast<uint32_t>(length), term)) {
+                    ok = true;
+                    break;
+                }
+                if (end == std::wstring_view::npos) break;
+                begin = end + 1;
+            }
+        }
+        if (term.name_not) ok = !ok;
+        if (!ok) return false;
+    }
+    return true;
+}
+
 int RankName(const wchar_t* s, uint32_t n, bool is_dir, const CompiledQuery& q) {
     int best = 0;
     for (const auto& g : q.groups) {
@@ -706,7 +750,7 @@ CompiledQuery ParseQuery(std::wstring_view raw) {
     return q;
 }
 
-std::wstring FilenameQueryText(std::wstring_view raw) {
+static std::wstring QueryTextWithoutScope(std::wstring_view raw, bool filename_only) {
     std::vector<size_t> or_breaks;
     const auto tokens = TokenizeQuery(raw, &or_breaks);
     std::wstring out;
@@ -731,7 +775,7 @@ std::wstring FilenameQueryText(std::wstring_view raw) {
             skipped_path_prefix = true;
             continue;
         }
-        if (SkipFromFilenameNeedle(tokens[i])) continue;
+        if (filename_only && SkipFromFilenameNeedle(tokens[i])) continue;
         if (!out.empty() && (group_has || out.ends_with(L'|') || out.ends_with(L' '))) {
             if (!out.ends_with(L' ') && !out.ends_with(L'|')) out.push_back(L' ');
             else if (out.ends_with(L'|')) out.push_back(L' ');
@@ -750,6 +794,14 @@ std::wstring FilenameQueryText(std::wstring_view raw) {
     }
     while (!out.empty() && (out.back() == L' ' || out.back() == L'|')) out.pop_back();
     return out;
+}
+
+std::wstring FilenameQueryText(std::wstring_view raw) {
+    return QueryTextWithoutScope(raw, true);
+}
+
+std::wstring QueryWithoutPathPrefix(std::wstring_view raw) {
+    return QueryTextWithoutScope(raw, false);
 }
 
 } // namespace pulse::index

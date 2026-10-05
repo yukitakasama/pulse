@@ -3,6 +3,7 @@
 #include "legacy_icons.h"
 #include "../common/windows_compat.h"
 #include "quick_preview_window.h"
+#include "preview_notice.h"
 #include "../common/localization.h"
 #include "../common/text_format.h"
 #include "../ipc/preview_protocol.h"
@@ -79,6 +80,7 @@ enum {
     kTextCmdSelectAll,
     kTextCmdFind,
     kTextCmdLineNumbers,
+    kArchiveCmdCopyPath,
     kFileCmdBase = 100,  // + static_cast<int>(QuickPreviewAction)
 };
 
@@ -183,6 +185,8 @@ void QuickPreviewWindow::ResetTextState() {
 }
 
 void QuickPreviewWindow::ResetView() {
+    preview_notice_.clear();
+    preview_notice_height_ = 0;
     ResetPlayback();
     text_scroll_ = 0.0f;
     pan_x_ = 0.0f;
@@ -207,6 +211,7 @@ void QuickPreviewWindow::ResetAnimation() {
     CancelPlaybackScrub();
     if (hwnd_) KillTimer(hwnd_, kAnimationTimer);
     frame_index_ = 0; requested_frame_ = 0; frame_count_ = 1; frame_delay_ms_ = 0;
+    sheet_request_ = 0;
     loop_count_ = 0; completed_loops_ = 0;
     animation_active_ = false; waiting_for_frame_ = false; animation_started_ = false;
 }
@@ -243,10 +248,7 @@ void QuickPreviewWindow::RecreateFormats() {
         DeleteObject(find_edit_font_);
         find_edit_font_ = nullptr;
     }
-    const int height = -std::max(1, static_cast<int>(std::lround(14.0f * scale_)));
-    find_edit_font_ = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, typography::PreferredTextFamily());
+    find_edit_font_ = typography::CreateEditFont(scale_);
     if (find_edit_ && find_edit_font_)
         SendMessageW(find_edit_, WM_SETFONT, reinterpret_cast<WPARAM>(find_edit_font_), TRUE);
     if (find_edit_brush_) {
@@ -266,6 +268,7 @@ void QuickPreviewWindow::Show(const QuickPreviewItem& item, bool dark, WindowEff
     }
     item_ = item;
     dark_ = dark;
+    commands_.Clear();
     effect_ = effect;
     safe_mode_ = safe_mode;
     handler_immediate_ = true;
@@ -315,6 +318,7 @@ void QuickPreviewWindow::Show(const QuickPreviewItem& item, bool dark, WindowEff
 
 void QuickPreviewWindow::Update(const QuickPreviewItem& item) {
     if (!visible() || item.path.empty()) return;
+    commands_.Clear();
     item_ = item;
     ++generation_;
     handler_immediate_ = false;
@@ -335,6 +339,7 @@ void QuickPreviewWindow::SetStarred(bool starred) {
 
 void QuickPreviewWindow::Close() {
     if (!hwnd_ || closing_) return;
+    commands_.Clear();
     handler_.Hide();
     ResetAnimation();
     ResetView();
@@ -417,7 +422,7 @@ D2D1_RECT_F QuickPreviewWindow::ContentRect() const {
     const float width = static_cast<float>(compositor_.Width());
     const float height = static_cast<float>(compositor_.Height());
     const float header = kTitleBarHeight * scale_;
-    return D2D1::RectF(0, header + FindBarHeight(), width, height - PlaybackHeight());
+    return D2D1::RectF(0, header + FindBarHeight() + preview_notice_height_, width, height - PlaybackHeight());
 }
 
 D2D1_RECT_F QuickPreviewWindow::ChromeButtonRect(ChromeButton button) const {
@@ -554,10 +559,31 @@ void QuickPreviewWindow::ActivateChromeButton(ChromeButton button) {
     }
 }
 
-void QuickPreviewWindow::PostAction(QuickPreviewAction action) {
+QuickPreviewItem QuickPreviewWindow::ActionTarget() const {
+    if (native_kind_ == NativeKind::Archive && archive_.IsFolderListing())
+        return FolderPreviewTarget(item_, archive_.SelectedPath(), archive_.SelectedIsDirectory());
+    return item_;
+}
+
+void QuickPreviewWindow::PostAction(QuickPreviewAction action, const QuickPreviewItem* target) {
     if (!owner_ || !command_message_ || action == QuickPreviewAction::None) return;
-    const LPARAM modifiers = (GetKeyState(VK_SHIFT) & 0x8000) ? 1 : 0;
-    PostMessageW(owner_, command_message_, static_cast<WPARAM>(action), modifiers);
+    if (native_kind_ == NativeKind::Archive &&
+        !CanApplyPreviewFileAction(archive_.IsFolderListing(), archive_.HasSelection())) {
+        if (action == QuickPreviewAction::CopyPath || action == QuickPreviewAction::Copy)
+            pulse::ops::WriteClipboardText(archive_.SelectedPath());
+        return;
+    }
+    QuickPreviewCommand command;
+    command.action = action;
+    command.target = target ? *target : ActionTarget();
+    if (command.target.path.empty()) return;
+    command.folder_child = command.target.path != item_.path;
+    command.shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const UINT_PTR token = commands_.Push(std::move(command));
+    if (token && !PostMessageW(owner_, command_message_, static_cast<WPARAM>(action), static_cast<LPARAM>(token))) {
+        QuickPreviewCommand ignored;
+        commands_.Take(token, ignored);
+    }
 }
 
 float QuickPreviewWindow::FitScale(float view_w, float view_h) const noexcept {
@@ -939,7 +965,7 @@ void QuickPreviewWindow::OpenFind() {
     SetForegroundWindow(GetAncestor(find_edit_, GA_ROOT));
     SetFocus(find_edit_);
     SendMessageW(find_edit_, EM_SETSEL, 0, -1);
-    if (compositor_.LumaTextEnabled())
+    if (compositor_.CustomEditEnabled())
         PaintFindEditLuma(find_edit_, nullptr);
 }
 
@@ -966,7 +992,7 @@ bool QuickPreviewWindow::EnsureFindEdit() {
     find_edit_ = CreateChildEdit(hwnd_);
     if (!find_edit_) return false;
     SetWindowTheme(find_edit_, L"", L"");
-    if (!compositor_.LumaTextEnabled())
+    if (!compositor_.CustomEditEnabled())
         SetLayeredWindowAttributes(find_edit_, 0, 255, LWA_ALPHA);
     if (find_edit_font_)
         SendMessageW(find_edit_, WM_SETFONT, reinterpret_cast<WPARAM>(find_edit_font_), TRUE);
@@ -987,17 +1013,7 @@ void QuickPreviewWindow::LayoutFindEdit() {
 
     const int w = (std::max)(40, static_cast<int>(std::lround(cell.right - cell.left)));
     const int cell_h = (std::max)(18, static_cast<int>(std::lround(cell.bottom - cell.top)));
-    int line_h = cell_h;
-    if (find_edit_font_) {
-        HDC hdc = GetDC(find_edit_);
-        HFONT old = static_cast<HFONT>(SelectObject(hdc, find_edit_font_));
-        TEXTMETRICW tm{};
-        GetTextMetricsW(hdc, &tm);
-        SelectObject(hdc, old);
-        ReleaseDC(find_edit_, hdc);
-        line_h = (std::max)(1, static_cast<int>(tm.tmHeight));
-    }
-    line_h = (std::min)(line_h, cell_h);
+    const int line_h = EditLineHeight(find_edit_, find_edit_font_, cell_h);
     const int y = pt.y + (std::max)(0, (cell_h - line_h) / 2);
     RECT cur{};
     GetWindowRect(find_edit_, &cur);
@@ -1008,7 +1024,7 @@ void QuickPreviewWindow::LayoutFindEdit() {
     UINT flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
     if (!moved) flags |= SWP_NOMOVE | SWP_NOSIZE | SWP_NOREDRAW;
     SetWindowPos(find_edit_, HWND_TOP, pt.x, y, w, line_h, flags);
-    if (moved && compositor_.LumaTextEnabled())
+    if (moved && compositor_.CustomEditEnabled())
         PaintFindEditLuma(find_edit_, nullptr);
 }
 
@@ -1033,7 +1049,7 @@ void QuickPreviewWindow::SyncFindFromEdit() {
 }
 
 void QuickPreviewWindow::PaintFindEditLuma(HWND hwnd, HDC hdc) {
-    if (!hwnd || !compositor_.LumaTextEnabled()) return;
+    if (!hwnd || !compositor_.CustomEditEnabled()) return;
     HideCaret(hwnd);
     IDWriteTextFormat* format = compositor_.AddressFormat();
     if (!format) format = compositor_.TextFormat();
@@ -1092,7 +1108,7 @@ LRESULT CALLBACK QuickPreviewWindow::FindEditProc(HWND hwnd, UINT message, WPARA
                                                   LPARAM lparam, UINT_PTR, DWORD_PTR data) {
     auto* self = reinterpret_cast<QuickPreviewWindow*>(data);
     if (!self) return DefSubclassProc(hwnd, message, wparam, lparam);
-    const bool luma = self->compositor_.LumaTextEnabled();
+    const bool luma = SynchronizeChildEditBackend(self->compositor_, hwnd);
     if (luma && (message == WM_PRINT || message == WM_PRINTCLIENT ||
                  message == WM_NCPAINT)) {
         return 0;
@@ -1198,7 +1214,13 @@ void QuickPreviewWindow::ShowContextMenu(POINT screen) {
     using pulse::l10n::StringId;
     const bool text_kind = native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex ||
                            native_kind_ == NativeKind::Markdown || native_kind_ == NativeKind::Table;
-    const bool file_verbs = owner_ && command_message_ != 0 && !item_.path.empty();
+    const QuickPreviewItem target = ActionTarget();
+    const uint64_t menu_generation = generation_;
+    const bool child = target.path != item_.path;
+    const bool archive_entry = native_kind_ == NativeKind::Archive &&
+        !CanApplyPreviewFileAction(archive_.IsFolderListing(), archive_.HasSelection());
+    const auto archive_path = archive_entry ? archive_.SelectedPath() : std::wstring{};
+    const bool file_verbs = !archive_entry && owner_ && command_message_ != 0 && !target.path.empty();
     std::vector<FluentMenuItem> items;
     const auto add = [&](int command, StringId label, const wchar_t* glyph,
                          const wchar_t* shortcut, bool enabled = true,
@@ -1215,6 +1237,10 @@ void QuickPreviewWindow::ShowContextMenu(POINT screen) {
     const auto file_cmd = [](QuickPreviewAction action) {
         return kFileCmdBase + static_cast<int>(action);
     };
+    if (archive_entry) {
+        add(kArchiveCmdCopyPath, StringId::CopyPath, kLinkGlyph, L"Ctrl+Shift+C");
+        items.back().text = pulse::l10n::Pick(L"复制包内路径", L"Copy path inside archive");
+    }
     if (text_kind) {
         // Text verbs keep their ids and order; file verbs follow below them.
         add(kTextCmdCopy, StringId::Copy, kCopyGlyph, L"Ctrl+C", HasTextSelection());
@@ -1235,7 +1261,7 @@ void QuickPreviewWindow::ShowContextMenu(POINT screen) {
         }
     }
     if (file_verbs) {
-        const bool writable = !item_.read_only;
+        const bool writable = !target.read_only;
         add(file_cmd(QuickPreviewAction::Open), StringId::Open, kOpenGlyph, L"Enter");
         if (!text_kind)
             add(file_cmd(QuickPreviewAction::Copy), StringId::Copy, kCopyGlyph, L"Ctrl+C");
@@ -1243,8 +1269,9 @@ void QuickPreviewWindow::ShowContextMenu(POINT screen) {
         add(file_cmd(QuickPreviewAction::CopyPath), StringId::CopyPath, kLinkGlyph,
             L"Ctrl+Shift+C", true, true);
         add(file_cmd(QuickPreviewAction::ToggleStar),
-            item_.starred ? StringId::Unstar : StringId::Star,
-            item_.starred ? kStarFilledGlyph : kStarGlyph, L"", true, true);
+            target.starred ? StringId::Unstar : StringId::Star,
+            target.starred ? kStarFilledGlyph : kStarGlyph, L"", true, true);
+        if (child) items.back().text = pulse::l10n::Pick(L"切换星标", L"Toggle star");
         add(file_cmd(QuickPreviewAction::Rename), StringId::Rename, kRenameGlyph, L"F2", writable);
         add(file_cmd(QuickPreviewAction::Delete), StringId::Delete, kDeleteGlyph, L"Delete",
             writable, true);
@@ -1254,6 +1281,7 @@ void QuickPreviewWindow::ShowContextMenu(POINT screen) {
     if (items.empty()) return;
     const int cmd = text_menu_.TrackPopup(screen, std::move(items));
     if (cmd == kTextCmdCopy) CopyTextSelection(true);
+    else if (cmd == kArchiveCmdCopyPath) pulse::ops::WriteClipboardText(archive_path);
     else if (cmd == kTextCmdSelectAll) SelectAllText();
     else if (cmd == kTextCmdFind) OpenFind();
     else if (cmd == kTextCmdLineNumbers) {
@@ -1261,8 +1289,8 @@ void QuickPreviewWindow::ShowContextMenu(POINT screen) {
         text_layout_.reset();
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
-    else if (cmd >= kFileCmdBase)
-        PostAction(static_cast<QuickPreviewAction>(cmd - kFileCmdBase));
+    else if (cmd >= kFileCmdBase && menu_generation == generation_ && visible())
+        PostAction(static_cast<QuickPreviewAction>(cmd - kFileCmdBase), &target);
 }
 
 void QuickPreviewWindow::UpdateFindMatches() {
@@ -1487,9 +1515,15 @@ void QuickPreviewWindow::DrawStatusPill(ID2D1DeviceContext* dc, const D2D1_RECT_
 
 // Enter / double-click on a row of a folder listing opens that item.
 bool QuickPreviewWindow::OpenListingSelection() {
-    if (!owner_ || !open_message_ || !archive_.IsFolderListing()) return false;
+    if (!owner_ || !archive_.IsFolderListing()) return false;
     const std::wstring relative = archive_.SelectedPath();
     if (relative.empty()) return false;
+    if (command_message_) {
+        const auto target = ActionTarget();
+        PostAction(QuickPreviewAction::Open, &target);
+        return true;
+    }
+    if (!open_message_) return false;
     open_path_ = item_.path;
     if (!open_path_.empty() && open_path_.back() != L'\\') open_path_ += L'\\';
     open_path_ += relative;
@@ -1674,6 +1708,9 @@ void QuickPreviewWindow::Render() {
                   close_brush.get(), D2D1_DRAW_TEXT_OPTIONS_CLIP,
                   DWRITE_MEASURING_MODE_NATURAL);
     DrawChromeButtons(dc, text_brush.get());
+    const D2D1_RECT_F notice_rect = D2D1::RectF(0, header + FindBarHeight(), width, height);
+    preview_notice_height_ = DrawPreviewNotice(dc, compositor_.DwriteFactory(), compositor_.SmallFormat(),
+        preview_notice_, notice_rect, scale_, CurrentTheme().text, CurrentTheme().fill_hover);
     const D2D1_RECT_F full_content = D2D1::RectF(0, header, width, height);
     const bool offline = OfflinePlaceholder();
     const bool use_handler = !offline && !safe_mode_ && !video_.active() &&
@@ -1696,7 +1733,7 @@ void QuickPreviewWindow::Render() {
         markdown_shown_ = true;
         toggle_kind_ = ToggleKind::DocHandler;
     }
-    codec_store_rect_ = codec_open_rect_ = D2D1_RECT_F{};
+    codec_store_rect_ = codec_open_rect_ = codec_pack_rect_ = D2D1_RECT_F{};
     std::wstring status;
     if (offline) {
         native_kind_ = NativeKind::None;
@@ -1714,7 +1751,10 @@ void QuickPreviewWindow::Render() {
         if (codec_card) {
             // The card explains the missing picture.
         } else if (FAILED(video.error))
-            status = pulse::l10n::Get(pulse::l10n::StringId::PreviewCannotRender);
+            status = video.unsupported_audio
+                ? l10n::HantText(l10n::Pick(L"系统无法解码此音频，请用默认应用打开。",
+                                          L"Windows cannot decode this audio. Open it in the default app."))
+                : pulse::l10n::Get(pulse::l10n::StringId::PreviewCannotRender);
         else if (!video.ready && !audio)
             status = pulse::l10n::Get(pulse::l10n::StringId::PreviewLoading);
     } else if (use_handler) {
@@ -1732,6 +1772,7 @@ void QuickPreviewWindow::Render() {
     } else {
         std::wstring text;
         std::wstring error;
+        preview::Integrity integrity;
         bool truncated = false;
         uint32_t bytes_read = 0;
         uint32_t reported_frame_count = 1, reported_delay_ms = 0, reported_loop_count = 0;
@@ -1752,7 +1793,13 @@ void QuickPreviewWindow::Render() {
         }
         const bool icon_unsized = icon && image_fit_ && (!decoded_w_ || !decoded_h_);
         dc->PushAxisAlignedClip(content, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        const uint32_t requested = icon ? icon_request_ : waiting_for_frame_ ? requested_frame_ : frame_index_;
+        if (table_.TakePendingSheetRequest(sheet_request_)) {
+            preview_text_.clear();
+            find_matches_.clear();
+            preview_notice_.clear();
+        }
+        const uint32_t requested = TableFileKind(item_.path) == 2 ? sheet_request_ :
+            icon ? icon_request_ : waiting_for_frame_ ? requested_frame_ : frame_index_;
         if (icon && !icon_sizes_.empty() && draw.right - draw.left < 8192.0f && draw.bottom - draw.top < 8192.0f) {
             // Transparent icon pixels sit on a checkerboard (mockup ⑥).
             ComPtr<ID2D1SolidColorBrush> cell;
@@ -1770,7 +1817,8 @@ void QuickPreviewWindow::Render() {
                 generation_, item_.modified, item_.size, 1.0f, &text, &truncated,
                 &bytes_read, true, &error, nullptr, nullptr, nullptr, nullptr,
                 frame, &reported_frame_count, &reported_delay_ms, &reported_loop_count,
-                &decoded_w_, &decoded_h_, &source_w_, &source_h_, nullptr, &text_encoding);
+                &decoded_w_, &decoded_h_, &source_w_, &source_h_, nullptr, &text_encoding,
+                false, nullptr, nullptr, &integrity);
         };
         PreviewDrawResult result = draw_at(want, requested);
         if (result == PreviewDrawResult::Pending && preview_pixels_ != 0 &&
@@ -1787,9 +1835,23 @@ void QuickPreviewWindow::Render() {
             uint32_t full_bytes = 0;
             if (thumbnails_.Draw(dc, draw, item_.path, item_.attrs, want, generation_,
                     item_.modified, item_.size, 1.0f, &full_text, &full_truncated, &full_bytes,
-                    true, &full_error, nullptr, nullptr, nullptr, nullptr, 1) ==
-                PreviewDrawResult::Archive)
+                    true, &full_error, nullptr, nullptr, nullptr, nullptr, 1,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, false, nullptr, nullptr, &integrity) ==
+                PreviewDrawResult::Archive) {
                 text = std::move(full_text);
+                error = std::move(full_error);
+            }
+        }
+        if (result != PreviewDrawResult::Pending) {
+            // The picture cards explain these failures themselves.
+            const bool codec_card = kImageExtras && result == PreviewDrawResult::Failed &&
+                (error.rfind(L"image-codec-missing:", 0) == 0 || error == L"image-pack-missing");
+            const auto notice = codec_card ? std::wstring{} : PreviewNotice(error, text, integrity);
+            if (notice != preview_notice_) {
+                preview_notice_ = notice;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
         }
         bool committed_frame = false;
         if (result == PreviewDrawResult::Bitmap && reported_frame_count > 1 &&
@@ -2013,6 +2075,11 @@ void QuickPreviewWindow::Render() {
             DrawTextPreview(dc, content, text_brush.get());
             DrawTextStatus(dc, content, result == PreviewDrawResult::Hex, bytes_read, truncated,
                            text_encoding, text_brush.get());
+        } else if (TableFileKind(item_.path) == 2 && table_.HasData() &&
+                   (result == PreviewDrawResult::Pending || result == PreviewDrawResult::Failed)) {
+            native_kind_ = NativeKind::Table;
+            if (result == PreviewDrawResult::Failed) table_.FailPendingSheetRequest(sheet_request_);
+            table_.Draw(dc, compositor_.DwriteFactory(), content, CurrentTheme(), dark_, scale_, background, {});
         } else if (result == PreviewDrawResult::Pending && !animation_started_) {
             native_kind_ = NativeKind::None;
             status = pulse::l10n::Get(pulse::l10n::StringId::PreviewLoading);
@@ -2020,6 +2087,9 @@ void QuickPreviewWindow::Render() {
                    error.rfind(L"image-codec-missing:", 0) == 0) {
             native_kind_ = NativeKind::None;
             DrawImageCodecCard(dc, content, error.substr(20), text_brush.get());
+        } else if (result == PreviewDrawResult::Failed && kImageExtras && error == L"image-pack-missing") {
+            native_kind_ = NativeKind::None;
+            DrawImageCodecCard(dc, content, L"pack", text_brush.get());
         } else if (result == PreviewDrawResult::Failed) {
             native_kind_ = NativeKind::None;
             status = pulse::l10n::Get(error == L"path-unavailable"
@@ -2434,6 +2504,10 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
         const D2D1_RECT_F content = ContentRect();
         const bool in_content = point.x >= content.left && point.x < content.right &&
             point.y >= content.top && point.y < content.bottom;
+        if (native_kind_ == NativeKind::Archive && in_content) {
+            archive_.SelectAt(static_cast<float>(point.x), static_cast<float>(point.y));
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
         if ((native_kind_ == NativeKind::Text || native_kind_ == NativeKind::Hex ||
              native_kind_ == NativeKind::Markdown) && in_content) {
             uint32_t index = 0;
@@ -2466,6 +2540,10 @@ LRESULT QuickPreviewWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM lp
             if (client.x < content.left || client.x >= content.right ||
                 client.y < content.top || client.y >= content.bottom)
                 break;  // caption right-click keeps the system menu
+            if (native_kind_ == NativeKind::Archive) {
+                archive_.SelectAt(static_cast<float>(client.x), static_cast<float>(client.y));
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
         }
         ShowContextMenu(screen);
         return 0;

@@ -37,9 +37,10 @@ std::wstring Fragment(const std::wstring& href) {
     return hash == std::wstring::npos ? std::wstring() : href.substr(hash + 1);
 }
 
-bool ReadPart(const std::wstring& path, const std::wstring& name, std::wstring& text) {
+bool ReadPart(const std::wstring& path, const std::wstring& name, std::wstring& text,
+              std::wstring* error = nullptr) {
     std::vector<unsigned char> bytes;
-    if (!ReadZipEntry(path, ToUtf8(name), kMaxPartBytes, bytes, nullptr)) return false;
+    if (!ReadZipEntry(path, ToUtf8(name), kMaxPartBytes, bytes, error)) return false;
     text = DecodeDocumentText(bytes);
     return true;
 }
@@ -449,6 +450,7 @@ bool MakeEpubDocument(const std::wstring& path, std::wstring& payload, uint32_t&
     struct Item { std::wstring href, type, properties; };
     std::map<std::wstring, Item> manifest;
     std::vector<std::wstring> spine;
+    size_t total_spine = 0;
     std::wstring title, author, ncx_id, nav_part;
     {
         XmlPull x(text, false);
@@ -466,8 +468,9 @@ bool MakeEpubDocument(const std::wstring& path, std::wstring& payload, uint32_t&
                     manifest[x.Attr(L"id")] = std::move(item);
                 } else if (n == L"spine") {
                     ncx_id = x.Attr(L"toc");
-                } else if (n == L"itemref" && spine.size() < kMaxSpine) {
-                    spine.push_back(x.Attr(L"idref"));
+                } else if (n == L"itemref") {
+                    ++total_spine;
+                    if (spine.size() < kMaxSpine) spine.push_back(x.Attr(L"idref"));
                 }
             } else if (k == XmlPull::Close) {
                 if (n == L"metadata") in_metadata = false;
@@ -496,37 +499,69 @@ bool MakeEpubDocument(const std::wstring& path, std::wstring& payload, uint32_t&
     const auto size = std::filesystem::file_size(std::filesystem::path(path), ec);
     bytes_read = ec ? 0u : static_cast<uint32_t>((std::min)(static_cast<std::uintmax_t>(size), std::uintmax_t{0xFFFFFFFFu}));
 
-    DocPayload out(ipc::kPreviewMaxTableChars - kTocReserve);
+    // Keep enough room for every spine position even after content fills up.
+    DocPayload out(ipc::kPreviewMaxTableChars - kTocReserve - spine.size() * 512);
     PreviewImageCache images;
     std::map<std::wstring, Anchor> anchors;
     std::map<std::wstring, size_t> section_of;  // part -> section
     std::vector<std::wstring> section_titles;
     HtmlConverter converter(path, out, images, anchors);
+    bool incomplete = total_spine > spine.size();
+    size_t loaded_chapters = 0;
     for (const std::wstring& idref : spine) {
-        if (out.full()) break;
         const auto it = manifest.find(idref);
-        if (it == manifest.end()) continue;
-        const Item& item = it->second;
+        const Item item = it == manifest.end() ? Item{} : it->second;
         const std::wstring lower = Lower(item.href);
         const bool html = item.type.find(L"html") != std::wstring::npos ||
                           lower.ends_with(L".xhtml") || lower.ends_with(L".html") || lower.ends_with(L".htm");
-        if (!html || section_of.count(item.href)) continue;
-        std::wstring body;
-        if (!ReadPart(path, item.href, body)) continue;
+        std::wstring body, error, reason;
+        if (out.full()) reason = L"Preview size limit reached; this chapter was not loaded.";
+        else if (it == manifest.end()) reason = L"Chapter manifest reference is missing.";
+        else if (!html) reason = item.type == L"image/svg+xml" || lower.ends_with(L".svg")
+            ? L"SVG chapter is not supported by the reading preview. Open the original book to view it."
+            : L"This chapter format is not supported by the reading preview.";
+        else if (!ReadPart(path, item.href, body, &error)) reason = error == L"entry-too-large"
+            ? L"Chapter exceeds the 16 MiB preview limit. Open the original book to read it."
+            : L"Chapter content could not be read (missing or damaged package entry).";
         // The chapter's name: its first TOC entry, else its <title>.
         std::wstring name;
         for (const TocEntry& e : toc) if (e.file == item.href) { name = e.title; break; }
+        name = name.substr(0, 120);
         const size_t section = section_titles.size();
+        if (!reason.empty()) {
+            incomplete = true;
+            if (name.empty()) name = L"Chapter " + std::to_wstring(section + 1);
+            DocPayload placeholder(512);
+            std::wstring record = L"P\t";
+            AppendPayloadField(record, name);
+            placeholder.Record(record);
+            placeholder.Begin(L'p');
+            placeholder.Text(reason);
+            placeholder.End();
+            out.str() += placeholder.str().substr(placeholder.str().find(L'\n') + 1);
+            if (!item.href.empty()) section_of.try_emplace(item.href, section);
+            section_titles.push_back(name);
+            continue;
+        }
         const size_t base = out.blocks();
         std::wstring record = L"P\t";
         const size_t record_at = out.str().size();
         AppendPayloadField(record, name);
         out.Record(record);
-        if (out.full()) break;
+        // The reserved placeholder budget also covers a P record at the limit.
+        if (out.full()) out.str() += record + L'\n';
         std::wstring html_title;
         converter.Convert(item.href, body, section, base, html_title);
+        if (!out.full()) ++loaded_chapters;
+        if (out.full()) {
+            DocPayload notice(256);
+            notice.Begin(L'p');
+            notice.Text(L"Preview size limit reached; this chapter may be incomplete.");
+            notice.End();
+            out.str() += notice.str().substr(notice.str().find(L'\n') + 1);
+        }
         if (name.empty()) {
-            name = Collapse(html_title);
+            name = Collapse(html_title).substr(0, 120);
             while (!name.empty() && name.front() == L' ') name.erase(0, 1);
             while (!name.empty() && name.back() == L' ') name.pop_back();
             if (!name.empty() && name != title) {
@@ -538,18 +573,25 @@ bool MakeEpubDocument(const std::wstring& path, std::wstring& payload, uint32_t&
                 name.clear();
             }
         }
-        section_of[item.href] = section;
+        section_of.try_emplace(item.href, section);
         section_titles.push_back(name);
     }
     if (section_titles.empty()) return false;
-    truncated = out.full();
+    if (total_spine > spine.size()) {
+        DocPayload notice(256);
+        notice.Begin(L'p');
+        notice.Text(L"Chapter limit reached: preview lists the first " + std::to_wstring(spine.size()) +
+                    L" of " + std::to_wstring(total_spine) + L" chapters.");
+        notice.End();
+        out.str() += notice.str().substr(notice.str().find(L'\n') + 1);
+    }
+    truncated = out.full() || incomplete;
 
     // Table of contents: the book's own, else one entry per named chapter.
     std::wstring& s = out.str();
     const size_t cap = ipc::kPreviewMaxTableChars - 2048;  // M still fits after
     size_t entries = 0;
     for (const TocEntry& e : toc) {
-        if (s.size() + e.title.size() + 64 > cap) break;
         const auto sec = section_of.find(e.file);
         if (sec == section_of.end()) continue;
         size_t block = 0;
@@ -557,20 +599,24 @@ bool MakeEpubDocument(const std::wstring& path, std::wstring& payload, uint32_t&
             const auto a = anchors.find(e.file + L"#" + e.fragment);
             if (a != anchors.end()) block = a->second.block;
         }
-        s += L"C\t" + std::to_wstring((std::min)(e.level, 6)) + L'\t' + std::to_wstring(sec->second) + L'\t' +
-             std::to_wstring(block) + L'\t';
-        AppendPayloadField(s, e.title);
-        s += L'\n';
+        std::wstring record = L"C\t" + std::to_wstring((std::min)(e.level, 6)) + L'\t' +
+            std::to_wstring(sec->second) + L'\t' + std::to_wstring(block) + L'\t';
+        AppendPayloadField(record, e.title);
+        record += L'\n';
+        if (s.size() + record.size() > cap) { truncated = true; break; }
+        s += record;
         ++entries;
     }
     if (!entries)
         for (size_t i = 0; i < section_titles.size(); ++i) {
             if (section_titles[i].empty()) continue;
-            if (s.size() + section_titles[i].size() + 64 > cap) break;
-            s += L"C\t0\t" + std::to_wstring(i) + L"\t0\t";
-            AppendPayloadField(s, section_titles[i]);
-            s += L'\n';
+            std::wstring record = L"C\t0\t" + std::to_wstring(i) + L"\t0\t";
+            AppendPayloadField(record, section_titles[i]);
+            record += L'\n';
+            if (s.size() + record.size() > cap) { truncated = true; break; }
+            s += record;
         }
+    s += L"V\tchapters\t" + std::to_wstring(loaded_chapters) + L'\t' + std::to_wstring(total_spine) + L'\n';
     s += L"M\tepub\t";
     AppendPayloadField(s, title.substr(0, 400));
     s += L'\t';

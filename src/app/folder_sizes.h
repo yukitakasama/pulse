@@ -9,14 +9,28 @@
 
 namespace pulse::app {
 enum class FolderSizeState { Manual, Calculating, Ready, Updating, Partial, Unavailable, Cached, Indexed };
+enum class FolderSizeSource { Unknown, Scan, Index };
 struct FolderSizeValue {
     FolderSizeState state = FolderSizeState::Manual;
     uint64_t bytes = 0;
     bool has_value = false;
+    // A lower bound remains incomplete while updating or restored from cache.
+    bool partial = false;
+    FolderSizeSource source = FolderSizeSource::Unknown;
+    // Only a complete scan protected by an uninterrupted watch is reusable.
+    bool verified = false;
+    uint64_t verified_revision = 0;
+    uint64_t verified_at = 0; // Unix milliseconds of the completed scan.
 };
 struct FolderSizeRequest {
     std::wstring path;
     bool automatic = true;
+    bool visible = true;
+};
+struct FolderSizeStats {
+    uint64_t jobs_started = 0, jobs_completed = 0, jobs_cancelled = 0;
+    uint64_t entries_scanned = 0, subtree_hits = 0, index_queries = 0;
+    uint64_t watch_gaps = 0, cache_items = 0;
 };
 
 // Window-thread methods only exchange in-memory state. Enumeration, watches and
@@ -37,6 +51,7 @@ public:
     std::unordered_map<std::wstring, uint64_t> KnownChildren(const std::wstring& parent) const;
     void Invalidate(const std::wstring& path);
     bool TakeChanged();
+    FolderSizeStats ReadStats() const;
     void Stop();
 private:
     struct Impl;

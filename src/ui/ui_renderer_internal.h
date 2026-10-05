@@ -1714,7 +1714,7 @@ TitleChrome MakeTitleChrome(float window_w, float scale, float title_h) {
 }
 
 constexpr float kSettingsNavW = 200.0f;
-constexpr int kSettingsNavCount = 5;
+constexpr int kSettingsNavCount = 6;  // 5: 预览增强包
 
 struct SettingsLayout {
     // Cards 0-4: Explorer groups (with a master switch). Card 5: Pulse's own
@@ -1732,9 +1732,25 @@ struct SettingsLayout {
     D2D1_RECT_F integration_section{}, integration_badge{}, integration_bar{}, integration_list_head{};
     D2D1_RECT_F integration_chip[4]{};
     float integration_text_right = 0.0f;
-    // General > Quick Look: supported formats card (disclosure[2]).
-    D2D1_RECT_F preview_section{}, preview_group{}, preview_formats{};
+    // Quick Look page: formats, source legend and system extensions.
+    D2D1_RECT_F preview_section{}, preview_group{}, preview_formats{}, preview_legend{}, preview_legend_note{};
+    D2D1_RECT_F preview_header_title{}, preview_header_summary{};
+    D2D1_RECT_F preview_legend_chip[3]{}, preview_codec_section{}, preview_codec_group{}, preview_codec_hint{}, pack_section{};
+    D2D1_RECT_F preview_codec_text[kPreviewCodecCount]{}, preview_codec_badge[kPreviewCodecCount]{};
     D2D1_RECT_F preview_codec_row[kPreviewCodecCount]{}, preview_codec_button[kPreviewCodecCount]{};
+    // 预览增强包 page (5), see LayoutSettingsPacks.
+    D2D1_RECT_F pack_summary{}, pack_open{}, pack_media_section{}, pack_card{}, pack_badge{}, pack_enable{},
+        pack_primary{}, pack_notice{}, pack_advanced_section{}, pack_custom_row{}, pack_path_row{},
+        pack_detect{}, pack_browse{}, pack_remove_row{}, pack_group{}, pack_note{}, pack_source_group{}, pack_source_status{};
+    float pack_desc_h = 0.0f;
+    // The image pack card (same parts as the FFmpeg one).
+    D2D1_RECT_F pack_images_section{}, pack_images_card{}, pack_images_badge{}, pack_images_enable{},
+        pack_images_primary{}, pack_images_notice{};
+    float pack_images_desc_h = 0.0f;
+    D2D1_RECT_F pack_raw_card{}, pack_raw_badge{}, pack_raw_enable{}, pack_raw_primary{}, pack_raw_notice{};
+    float pack_raw_desc_h = 0.0f;
+    D2D1_RECT_F pack_archive_section{}, pack_archive_card{}, pack_archive_badge{}, pack_archive_enable{}, pack_archive_primary{}, pack_archive_notice{};
+    float pack_archive_desc_h = 0.0f;
     D2D1_RECT_F content_header{}, content_types{}, content_pause{}, content_options{}, content_rebuild{}, content_empty{};
     D2D1_RECT_F body{};
     D2D1_RECT_F nav{};
@@ -1745,7 +1761,7 @@ struct SettingsLayout {
     D2D1_RECT_F effect_card{};
     D2D1_RECT_F effect_row[kWindowEffectCount]{};
     D2D1_RECT_F density_card{};
-    D2D1_RECT_F list_style_row[5]{};
+    D2D1_RECT_F list_style_row[6]{};
     D2D1_RECT_F density_row[3]{};
     D2D1_RECT_F folder_sort_card{};
     D2D1_RECT_F folder_sort_row[3]{};
@@ -1888,7 +1904,7 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
     l.nav = D2D1::RectF(l.body.left, l.body.top, l.body.left + nav_width, l.body.bottom);
     l.content = D2D1::RectF(l.nav.right, l.body.top, l.body.right, l.body.bottom);
     for (int i = 0; i < kSettingsNavCount; ++i) {
-        const int position = i == 4 ? 3 : i;
+        const int position = i == 4 ? 3 : i == 5 ? 4 : i;
         const float top = i == 3 ? l.nav.bottom - 92*scale : l.nav.top + (20 + position*46)*scale;
         l.nav_row[i] = D2D1::RectF(l.nav.left + 8*scale, top, l.nav.right - 8*scale, top + 40*scale);
     }
@@ -2147,6 +2163,8 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         }
         l.release_card = D2D1::RectF(card_left, release_top, card_right, ry + 10.0f * scale);
         y = l.release_card.bottom + 24.0f * scale;
+    } else if (vm.settings_page == 5) {
+        y = LayoutSettingsPacks(l, vm, scale, y, painter);
     } else if (vm.settings_page == 4) {
         const float card_left = l.content.left + pad;
         const float card_right = l.content.right - pad;

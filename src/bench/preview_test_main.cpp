@@ -455,8 +455,11 @@ static int RunProbe(const std::wstring& file, uint32_t pixels, const wchar_t* bm
 
 bool RunThumbnailCacheTests();
 bool RunThumbnailPropertiesRegression();
+bool RunThumbnailSheetRegression();
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && wcscmp(argv[1], L"--sheet-regression") == 0)
+        return RunThumbnailSheetRegression() ? 0 : 1;
     if (argc == 2 && wcscmp(argv[1], L"--properties-regression") == 0)
         return RunThumbnailPropertiesRegression() ? 0 : 1;
     if (argc >= 4 && wcscmp(argv[1], L"--coverage") == 0) {

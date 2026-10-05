@@ -70,6 +70,33 @@ static void NotifyTraySkipped(AppState& s, size_t n) {
 }
 
 // Release one tray batch into the current folder through the ops layer.
+// Every paste that moves a cut finishes it the same way: once all of the cut's
+// items have moved (app_main's completion handler), the system clipboard is
+// emptied - but only while it still holds exactly that cut (sequence number
+// and paths), so a newer copy is never touched.
+static void TrackCutClipboard(AppState& s, const ops::ClipboardData& cut) {
+    s.cutPaths.clear();
+    s.pendingCutClipboardSequence = cut.sequence;
+    s.pendingCutClipboardPaths = cut.paths;
+    s.completedCutClipboardPaths.clear();
+}
+
+// Ctrl+X mirrors a tray move batch onto the system clipboard (CollectToTray).
+// When the tray releases those items instead, the mirrored cut is finished as
+// well, as long as every clipboard path is among the items being moved.
+static void TrackTrayCutClipboard(AppState& s, const std::vector<std::wstring>& moved) {
+    ops::ClipboardData cut;
+    if (moved.empty() || !ops::ReadClipboard(cut) || !cut.cut) return;
+    for (const auto& path : cut.paths) {
+        const std::wstring normalized = fs::NormalizePath(path);
+        const bool staged = std::any_of(moved.begin(), moved.end(), [&](const std::wstring& item) {
+            return _wcsicmp(fs::NormalizePath(item).c_str(), normalized.c_str()) == 0;
+        });
+        if (!staged) return;
+    }
+    TrackCutClipboard(s, cut);
+}
+
 void ReleaseTrayBatch(AppState& s, size_t idx) {
     app::Tab* tab = ActiveTab(s);
     if (!tab || idx >= s.tray.batches().size()) return;
@@ -85,7 +112,9 @@ void ReleaseTrayBatch(AppState& s, size_t idx) {
     }
     NotifyTraySkipped(s, skipped);
     if (req.sources.empty()) return;
+    const std::vector<std::wstring> moved = b.move_intent ? req.sources : std::vector<std::wstring>{};
     if (!SubmitWithConflictResolution(s, std::move(req))) return;
+    TrackTrayCutClipboard(s, moved);
     RememberTrayDest(s, tab->current_path);
     // Move batches are consumed by release; copy batches stay staged so the
     // same set can be dropped into several folders (like a clipboard copy).
@@ -138,7 +167,9 @@ void SendTrayToDest(AppState& s, const std::wstring& dir, bool move) {
                 ++skipped;
     NotifyTraySkipped(s, skipped);
     if (req.sources.empty()) return;
+    const std::vector<std::wstring> moved = move ? req.sources : std::vector<std::wstring>{};
     if (!SubmitWithConflictResolution(s, std::move(req))) return;
+    TrackTrayCutClipboard(s, moved);
     RememberTrayDest(s, dir);
     if (move) s.tray.Clear(); // moved items leave their old paths behind
     InvalidateRect(s.hwnd, nullptr, FALSE);
@@ -160,12 +191,7 @@ void PasteIntoCurrent(AppState& s) {
         req.type = cb.cut ? ops::OpType::Move : ops::OpType::Copy;
         req.dest_dir = tab->current_path;
         for (auto& p : cb.paths) req.sources.push_back(fs::NormalizePath(p));
-        if (SubmitWithConflictResolution(s, std::move(req)) && cb.cut) {
-            s.cutPaths.clear();
-            s.pendingCutClipboardSequence = cb.sequence;
-            s.pendingCutClipboardPaths = cb.paths;
-            s.completedCutClipboardPaths.clear();
-        }
+        if (SubmitWithConflictResolution(s, std::move(req)) && cb.cut) TrackCutClipboard(s, cb);
     }
 }
 
@@ -220,6 +246,10 @@ void DeleteSelected(AppState& s, bool permanent) {
         return;
     }
     std::vector<std::wstring> paths = SelectedFullPaths(*tab);
+    DeletePaths(s, std::move(paths), permanent);
+}
+
+void DeletePaths(AppState& s, std::vector<std::wstring> paths, bool permanent) {
     if (paths.empty()) return;
     if (permanent) {
         ui::ConfirmDialogSpec confirm;
@@ -299,6 +329,10 @@ void CollectToTray(AppState& s, bool move_intent) {
     app::Tab* tab = ActiveTab(s);
     if (!tab || !tab->snapshot || IsRecycleTab(tab)) return;
     std::vector<std::wstring> paths = SelectedFullPaths(*tab);
+    CollectPathsToTray(s, paths, move_intent);
+}
+
+void CollectPathsToTray(AppState& s, const std::vector<std::wstring>& paths, bool move_intent) {
     if (!paths.empty()) {
         s.tray.Collect(paths, move_intent);
         // Mirror the cut state onto the list rows (ui.md §5.2 rule 6).
@@ -322,43 +356,38 @@ void PinAndShowOperationWindow(AppState& s) {
     s.operationWindow->Show(true);
 }
 
+// Both batch-rename entries (the selection and the tray) submit through here.
+// Nothing else changes up front: places and the tray follow the renames that
+// actually succeeded once the operation completes (app_main's completion
+// handler), so a failed or cancelled item never leaves a stale new name behind.
+static void SubmitBatchRename(AppState& s, const std::vector<std::wstring>& paths, app::Tab* select_in) {
+    if (paths.size() < 2) return;
+    const auto result = ui::ShowBatchRenameDialog(s.hwnd, paths, s.darkMode, s.accentColor);
+    if (!result.accepted) return;
+    ops::OpRequest req;
+    req.type = ops::OpType::BatchRename;
+    for (const auto& item : result.items) {
+        if (item.status != app::BatchRenameStatus::Ok) continue;
+        req.sources.push_back(item.source_path);
+        req.new_names.push_back(item.new_name);
+    }
+    if (req.sources.empty()) return;
+    if (select_in) {
+        select_in->pending_selected_names = req.new_names;
+        select_in->pending_selected_name = req.new_names.front();
+    }
+    s.ops.Submit(std::move(req));
+    InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
 void ShowBatchRename(AppState& s) {
     if(DeferContentSelection(s,[=](AppState& v){ShowBatchRename(v);})) return;
     app::Tab* tab = ActiveTab(s);
     if (!tab || IsRecycleTab(tab) || tab->net_readonly) return;
-    std::vector<std::wstring> paths = SelectedFullPaths(*tab);
-    if (paths.size() < 2) return;
-    const auto result = ui::ShowBatchRenameDialog(s.hwnd, paths, s.darkMode, s.accentColor);
-    if (!result.accepted) return;
-    ops::OpRequest req;
-    req.type = ops::OpType::BatchRename;
-    for (const auto& item : result.items) {
-        if (item.status != app::BatchRenameStatus::Ok) continue;
-        req.sources.push_back(item.source_path);
-        req.new_names.push_back(item.new_name);
-    }
-    if (req.sources.empty()) return;
-    tab->pending_selected_names = req.new_names;
-    if (!req.new_names.empty()) tab->pending_selected_name = req.new_names.front();
-    s.ops.Submit(std::move(req));
+    SubmitBatchRename(s, SelectedFullPaths(*tab), tab);
 }
 void ShowBatchRenamePaths(AppState& s, const std::vector<std::wstring>& paths) {
-    if (paths.size() < 2) return;
-    const auto result = ui::ShowBatchRenameDialog(s.hwnd, paths, s.darkMode, s.accentColor);
-    if (!result.accepted) return;
-    ops::OpRequest req;
-    req.type = ops::OpType::BatchRename;
-    for (const auto& item : result.items) {
-        if (item.status != app::BatchRenameStatus::Ok) continue;
-        req.sources.push_back(item.source_path);
-        req.new_names.push_back(item.new_name);
-        std::wstring parent = fs::ParentPath(item.source_path);
-        if (!parent.empty() && parent.back() != L'\\') parent += L'\\';
-        s.tray.ReplacePath(item.source_path, parent + item.new_name);
-    }
-    if (req.sources.empty()) return;
-    s.ops.Submit(std::move(req));
-    InvalidateRect(s.hwnd, nullptr, FALSE);
+    SubmitBatchRename(s, paths, nullptr);
 }
 
 void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
@@ -401,6 +430,12 @@ void UpdateOperationWindow(AppState& s, bool allow_conflict_dialog) {
     if (status.task_id != 0 && status.task_id == s.operationDismissedTaskId &&
         !s.operationPinnedByUser) {
         if (s.operationWindow->IsVisible()) s.operationWindow->Hide();
+        return;
+    }
+
+    if (status.active && status.authorization != ops::AuthorizationState::None) {
+        // Keep the existing operation window visible without stealing focus from UAC.
+        if (!s.operationWindow->IsVisible()) s.operationWindow->Show(false);
         return;
     }
 

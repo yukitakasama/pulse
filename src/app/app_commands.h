@@ -1,6 +1,7 @@
 // app_commands.h — Menus, omnibar, view/split, tags, settings chrome.
 #pragma once
 #include "app_runtime.h"
+#include "../ui/quick_preview_command.h"
 
 namespace pulse {
 bool EnsureMenu(AppState& s);
@@ -103,7 +104,7 @@ bool SelectedQuickPreviewItem(AppState& s, ui::QuickPreviewItem& item);
 void ToggleQuickPreview(AppState& s);
 void NavigateQuickPreview(AppState& s, int direction);
 // File verb requested from inside the quick preview (WM_QUICK_PREVIEW_COMMAND).
-void HandleQuickPreviewCommand(AppState& s, ui::QuickPreviewAction action, bool shift);
+void HandleQuickPreviewCommand(AppState& s, const ui::QuickPreviewCommand& command);
 // Keeps an open quick preview in step with the focused listing after a
 // snapshot refresh or directory notification: reloads a changed file,
 // re-anchors after an in-preview delete, closes when the entry is gone.

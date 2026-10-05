@@ -1,5 +1,6 @@
 // context_menu_prefs.cpp — JSON load/save for the Explorer fusion-zone prefs.
 #include "context_menu_prefs.h"
+#include "../common/config_json.h"
 #include "session.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
@@ -10,22 +11,7 @@
 namespace pulse::app {
 namespace {
 
-std::wstring ExtractObject(const std::wstring& json, const std::wstring& key) {
-    const std::wstring quoted = L"\"" + key + L"\"";
-    size_t pos = json.find(quoted);
-    if (pos == std::wstring::npos) return L"";
-    pos = json.find(L'{', pos + quoted.size());
-    if (pos == std::wstring::npos) return L"";
-    int depth = 0;
-    for (size_t i = pos; i < json.size(); ++i) {
-        if (json[i] == L'{') ++depth;
-        else if (json[i] == L'}') {
-            --depth;
-            if (depth == 0) return json.substr(pos, i - pos + 1);
-        }
-    }
-    return L"";
-}
+using pulse::json::ExtractObject;
 
 int ClampCap(int v, int lo, int hi, int fallback) {
     if (v < lo || v > hi) return fallback;
@@ -282,7 +268,7 @@ std::wstring ContextMenuPrefs::ToJson() const {
 }
 
 bool ContextMenuPrefs::FromJson(const std::wstring& json) {
-    if (json.empty()) return false;
+    if (!pulse::json::ValidConfigObject(json)) return false;
     explorer_cap = ClampCap(pulse::json::ExtractInt(json, L"explorer_cap", ipc::kDefaultExplorerCap),
                             1, 48, ipc::kDefaultExplorerCap);
     open_with_mru = ClampCap(pulse::json::ExtractInt(json, L"open_with_mru", 2), 0, 8, 2);
@@ -307,66 +293,33 @@ bool ContextMenuPrefs::FromJson(const std::wstring& json) {
             builtin_hidden |= BuiltinMenuBit(item);
     }
 
+    // Keys are menu ids such as "h:{GUID}" and texts are whatever the menu
+    // shows, so values are walked with the shared string-aware readers.
     item_enabled.clear();
-    const std::wstring items = ExtractObject(json, L"items");
-    if (!items.empty()) {
-        size_t pos = 1;
-        while (pos < items.size()) {
-            while (pos < items.size() && items[pos] != L'"' && items[pos] != L'}') ++pos;
-            if (pos >= items.size() || items[pos] == L'}') break;
-            ++pos;
-            const std::wstring key = pulse::json::UnescapeString(items, pos);
-            size_t obj = items.find(L'{', pos);
-            if (obj == std::wstring::npos) break;
-            size_t end = items.find(L'}', obj);
-            if (end == std::wstring::npos) break;
-            const std::wstring block = items.substr(obj, end - obj + 1);
+    pulse::json::ForEachMember(ExtractObject(json, L"items"),
+        [&](const std::wstring& key, const std::wstring& block) {
             item_enabled[key] = pulse::json::ExtractBool(block, L"enabled", true);
-            pos = end + 1;
-        }
-    }
+        });
 
     seen.clear();
-    size_t pos = json.find(L"\"seen\"");
-    if (pos != std::wstring::npos) pos = json.find(L'[', pos);
-    if (pos != std::wstring::npos) {
-        ++pos;
-        while (pos < json.size() && json[pos] != L']') {
-            const size_t obj = json.find(L'{', pos);
-            if (obj == std::wstring::npos) break;
-            const size_t close_arr = json.find(L']', pos);
-            if (close_arr != std::wstring::npos && obj > close_arr) break;
-            const size_t end = json.find(L'}', obj);
-            if (end == std::wstring::npos) break;
-            const std::wstring block = json.substr(obj, end - obj + 1);
-            SeenMenuItem item;
-            item.key = pulse::json::ExtractString(block, L"key");
-            item.text = pulse::json::ExtractString(block, L"text");
-            item.flyout = pulse::json::ExtractString(block, L"kind") == L"flyout";
-            item.from_com = pulse::json::ExtractString(block, L"source") == L"com";
-            item.category = ipc::ParseCtxMenuCategory(pulse::json::ExtractString(block, L"category"));
-            if (!item.key.empty() && !item.text.empty()) seen.push_back(std::move(item));
-            pos = end + 1;
-        }
-    }
+    pulse::json::ForEachElement(pulse::json::ExtractArray(json, L"seen"), [&](const std::wstring& block) {
+        if (block.empty() || block.front() != L'{') return;
+        SeenMenuItem item;
+        item.key = pulse::json::ExtractString(block, L"key");
+        item.text = pulse::json::ExtractString(block, L"text");
+        item.flyout = pulse::json::ExtractString(block, L"kind") == L"flyout";
+        item.from_com = pulse::json::ExtractString(block, L"source") == L"com";
+        item.category = ipc::ParseCtxMenuCategory(pulse::json::ExtractString(block, L"category"));
+        if (!item.key.empty() && !item.text.empty()) seen.push_back(std::move(item));
+    });
 
     MigrateSeenKeys();
     CoalesceCompressCatalog();
 
     slow_ext.clear();
-    const std::wstring slow = ExtractObject(json, L"slow_ext");
-    if (!slow.empty()) {
-        size_t p = 1;
-        while (p < slow.size()) {
-            while (p < slow.size() && slow[p] != L'"' && slow[p] != L'}') ++p;
-            if (p >= slow.size() || slow[p] == L'}') break;
-            ++p;
-            const std::wstring key = pulse::json::UnescapeString(slow, p);
-            size_t obj = slow.find(L'{', p);
-            if (obj == std::wstring::npos) break;
-            size_t end = slow.find(L'}', obj);
-            if (end == std::wstring::npos) break;
-            const std::wstring block = slow.substr(obj, end - obj + 1);
+    pulse::json::ForEachMember(ExtractObject(json, L"slow_ext"),
+        [&](const std::wstring& key, const std::wstring& block) {
+            if (key.empty() || block.empty() || block.front() != L'{') return;
             SlowComExt st;
             st.last_ms = static_cast<uint32_t>(
                 std::max(0, pulse::json::ExtractInt(block, L"ms", 0)));
@@ -376,10 +329,8 @@ bool ContextMenuPrefs::FromJson(const std::wstring& json) {
                 std::max(0, pulse::json::ExtractInt(block, L"timeout", 0)));
             st.deferred = pulse::json::ExtractBool(block, L"deferred", false);
             st.disabled = pulse::json::ExtractBool(block, L"disabled", false);
-            if (!key.empty()) slow_ext[key] = st;
-            p = end + 1;
-        }
-    }
+            slow_ext[key] = st;
+        });
     return true;
 }
 
@@ -465,14 +416,24 @@ void ContextMenuPrefs::CoalesceCompressCatalog() {
 
 bool ContextMenuPrefs::Load() {
     const std::wstring dir = GetPulseDataDir();
-    if (dir.empty()) return false;
+    if (dir.empty()) { load_failed = true; return false; }
+    const std::wstring file = dir + L"\\context_menu.json";
+    const DWORD attributes = GetFileAttributesW(file.c_str());
+    const DWORD code = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    const bool missing = attributes == INVALID_FILE_ATTRIBUTES &&
+        (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND);
     std::wstring json;
-    if (!ReadUtf8File(dir + L"\\context_menu.json", json) || json.empty()) return false;
-    return FromJson(json);
+    if (!missing && (!ReadUtf8File(file, json) || !FromJson(json))) {
+        load_failed = true;
+        return false;
+    }
+    load_failed = false;
+    return true;
 }
 
 bool ContextMenuPrefs::Save() const {
     if (!persist) return true;
+    if (load_failed) return false;
     const std::wstring dir = GetPulseDataDir();
     if (dir.empty()) return false;
     return WriteUtf8FileAtomic(dir + L"\\context_menu.json", ToJson());

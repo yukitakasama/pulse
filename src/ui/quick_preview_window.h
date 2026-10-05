@@ -11,36 +11,12 @@
 #include "fluent_menu.h"
 #include "video_preview.h"
 #include "audio_waveform.h"
+#include "quick_preview_command.h"
 
 #include <string>
 #include <vector>
 
 namespace pulse::ui {
-
-struct QuickPreviewItem {
-    std::wstring path;
-    std::wstring name;
-    DWORD attrs = 0;
-    uint64_t modified = 0;
-    uint64_t size = 0;
-    bool starred = false;    // Places star state; drives the Star/Unstar verb label
-    bool read_only = false;  // recycle / read-only view: no cut, rename, delete
-};
-
-// File verbs the preview asks its owner to run on the previewed entry. Posted
-// as wParam of the command message given to Initialize; lParam bit 0 mirrors
-// the Shift key so Delete can mean "permanent delete" like the main list.
-enum class QuickPreviewAction : int {
-    None = 0,
-    Open,
-    Cut,
-    Copy,
-    CopyPath,
-    ToggleStar,
-    Rename,
-    Delete,
-    Properties,
-};
 
 class QuickPreviewWindow {
 public:
@@ -57,10 +33,19 @@ public:
               const POINT* zoom_from = nullptr);
     void Update(const QuickPreviewItem& item);
     void SetStarred(bool starred);
+    // The FFmpeg preview pack offer on the codec cards; repaints on change.
+    void SetMediaPackOffer(const MediaPackOffer& offer);
+    // A pack was installed: a file it can play now is opened again.
+    void OnMediaPackInstalled();
+    // The image preview pack offer on the picture cards, and its install.
+    void SetImagePackOffer(const MediaPackOffer& offer);
+    void OnImagePackInstalled();
+    void OnExtraPackInstalled();
     void Close();
     bool visible() const noexcept;
     HWND hwnd() const noexcept { return hwnd_; }
     const QuickPreviewItem& item() const noexcept { return item_; }
+    bool TakeCommand(UINT_PTR token, QuickPreviewCommand& command) { return commands_.Take(token, command); }
     // Path chosen inside a folder listing, handed over once with open_message_.
     std::wstring TakeOpenPath() { std::wstring path; path.swap(open_path_); return path; }
 
@@ -108,6 +93,8 @@ private:
     // Aspect-fitted, rounded video window inside the content area (plus shadow).
     D2D1_RECT_F VideoFrameRect(const VideoPreview::State& state) const;
     void LayoutVideo(ID2D1DeviceContext* dc, const VideoPreview::State& state, bool show);
+    // FFmpeg playback is composed here, clipped like the video child.
+    void DrawFfmpegFrame(ID2D1DeviceContext* dc, const D2D1_RECT_F& frame, float radius);
     bool PlaybackHover(POINT client);             // true when hover state changed
     bool PlaybackWheel(POINT client, float steps);  // wheel over the volume button
     // Card shown instead of a black frame when no decoder handles the video track.
@@ -121,6 +108,8 @@ private:
         std::wstring title, lead, name, tail, get, hint;
         const wchar_t* store_id = nullptr;
         bool picture = false;
+        bool pack = false;   // offer a preview pack above the Store button
+        bool image_pack = false;   // ...the image pack rather than FFmpeg
     };
     void DrawCodecCardText(ID2D1DeviceContext* dc, const D2D1_RECT_F& content,
                            const CodecCardText& text, ID2D1SolidColorBrush* brush);
@@ -161,6 +150,7 @@ private:
     // the shared playback bar.
     bool IsAudioPreview() const;
     bool AudioMouseDown(POINT client);
+    bool AudioHover(POINT client);               // true when the hover changed
     void DrawAudio(ID2D1DeviceContext* dc, const VideoPreview::State& state,
                    ID2D1SolidColorBrush* text_brush, ID2D1SolidColorBrush* secondary_brush);
 
@@ -204,7 +194,8 @@ private:
     void PaintFindEditLuma(HWND hwnd, HDC hdc);
     LRESULT ForwardFindEditKeepLuma(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
     void ShowContextMenu(POINT screen);
-    void PostAction(QuickPreviewAction action);
+    QuickPreviewItem ActionTarget() const;
+    void PostAction(QuickPreviewAction action, const QuickPreviewItem* target = nullptr);
     D2D1_RECT_F ChromeButtonRect(ChromeButton button) const;
     // "Rendered | Source" pill left of the chrome buttons; segment -1 = whole pill.
     D2D1_RECT_F MarkdownToggleRect(int segment) const;
@@ -230,6 +221,7 @@ private:
     VideoPreview video_;
     AudioWaveform waveform_;
     D2D1_RECT_F audio_wave_rect_{};
+    float audio_hover_x_ = -1.0f;                // pointer x over the waveform, or -1
     bool playback_drag_ = false;
     bool playback_resume_ = false;
     bool playback_scrub_pending_ = false;
@@ -245,11 +237,23 @@ private:
     ULONGLONG playback_note_until_ = 0;
     D2D1_RECT_F codec_store_rect_{};   // codec card buttons (this frame)
     D2D1_RECT_F codec_open_rect_{};
+    D2D1_RECT_F codec_pack_rect_{};
+    ComPtr<ID2D1Bitmap> ffmpeg_bitmap_;        // reused while the size stays
+    ComPtr<ID2D1BitmapBrush> ffmpeg_brush_;
+    ComPtr<ID2D1Device> ffmpeg_device_;        // the bitmap's device
+    uint64_t ffmpeg_serial_ = 0;
+    bool ffmpeg_noted_ = false;               // the "FFmpeg" chip note was shown
+    MediaPackOffer pack_offer_;
+    MediaPackOffer image_offer_;
+    bool codec_pack_image_ = false;   // codec_pack_rect_ installs the image pack
     std::wstring codec_store_id_;
     ComPtr<IDWriteTextFormat> close_format_;
     ComPtr<IDWriteTextFormat> preview_text_format_;
     ComPtr<IDWriteTextLayout> text_layout_;
     QuickPreviewItem item_;
+    QuickPreviewCommands commands_;
+    std::wstring preview_notice_;
+    float preview_notice_height_ = 0;
     uint64_t generation_ = 1;
     bool dark_ = false;
     WindowEffect effect_ = WindowEffect::MicaAlt;
@@ -281,6 +285,7 @@ private:
     enum class ToggleKind { Markdown, TableSource, TableHandler, TreeSource, NotebookSource, DocHandler };
     ToggleKind toggle_kind_ = ToggleKind::Markdown;
     TableView table_;
+    uint32_t sheet_request_ = 0;
     bool table_source_ = false;   // session-wide: CSV shown as source
     bool table_handler_ = false;  // session-wide: XLSX in the system preview handler
     TreeView tree_;

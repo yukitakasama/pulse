@@ -3,6 +3,7 @@
 #include "../common/runtime_log.h"
 #include "operation_presentation.h"
 #include "shell_command.h"
+#include "elevated_transfer.h"
 #include "../ipc/shell_client.h"
 #include "../common/json_utils.h"
 #include "../common/localization.h"
@@ -868,12 +869,14 @@ void OpsManager::Start(std::function<void()> notify) {
         menu_running_ = true;
     }
     thread_ = std::thread([this] { WorkerThread(); });
+#ifndef PULSE_ELEVATED_HOST
     menu_thread_ = std::thread([this] { MenuThread(); });
     {
         std::lock_guard<std::mutex> lock(open_mutex_);
         open_running_ = true;
     }
     open_thread_ = std::thread([this] { OpenThread(); });
+#endif
 }
 
 void OpsManager::Stop() {
@@ -984,34 +987,11 @@ void OpsManager::ExecuteCommand(const std::wstring& command, const std::wstring&
     EnqueueOpen(std::move(item));
 }
 
-std::wstring TerminalCommandLine(const std::wstring& dir) {
-    std::wstring quoted = L"\"";
-    size_t slashes = 0;
-    for (const wchar_t c : dir) {
-        if (c == L'\\') {
-            ++slashes;
-            continue;
-        }
-        if (c == L'\"') {
-            quoted.append(slashes * 2 + 1, L'\\');
-            quoted.push_back(c);
-        } else {
-            quoted.append(slashes, L'\\');
-            quoted.push_back(c);
-        }
-        slashes = 0;
-    }
-    // Backslashes immediately before a closing quote must be doubled.
-    quoted.append(slashes * 2, L'\\');
-    quoted.push_back(L'\"');
-    return L"-d " + quoted;
-}
-
 void OpsManager::OpenTerminal(const std::wstring& dir) {
     QueueItem item;
     item.open_path = dir;
     item.open_file = L"wt.exe";
-    item.open_verb = L"open";
+    item.open_verb = L"__terminal";
     item.open_args = TerminalCommandLine(dir);
     EnqueueOpen(std::move(item));
 }
@@ -1024,6 +1004,7 @@ void OpsManager::OpenProgramIn(const std::wstring& exe, const std::wstring& dir,
     item.open_file = exe;
     item.open_verb = L"open";
     if (_wcsicmp(exe.c_str(), L"wt.exe") == 0) {
+        item.open_verb = L"__terminal";
         item.open_args = TerminalCommandLine(dir);
         if (!args.empty()) item.open_args += L" " + args;
     } else {
@@ -1391,6 +1372,24 @@ void OpsManager::OpenThread() {
         HWND dialog_owner = ui_hwnd_.load();
         if (!dialog_owner || !IsWindow(dialog_owner)) dialog_owner = GetForegroundWindow();
 
+        if (_wcsicmp(item.open_verb.c_str(), L"__terminal") == 0) {
+            const auto started = GetTickCount64();
+            const auto result = LaunchTerminal(item.open_file, item.open_args, item.open_path, dialog_owner);
+            diagnostics::runtime::Event("terminal_launch_result", {{"task", item.seq},
+                {"open_error", result.open_error}, {"error", result.error},
+                {"cancelled", result.error == ERROR_CANCELLED},
+                {"elevation_requested", result.elevation_requested}, {"elapsed_ms", GetTickCount64() - started}});
+            if (result.error && result.error != ERROR_CANCELLED) {
+                wchar_t detail[512]{};
+                FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+                    result.error, 0, detail, ARRAYSIZE(detail), nullptr);
+                const auto message = std::wstring(l10n::Pick(L"无法打开终端。", L"Could not open the terminal.")) +
+                    L"\n" + detail + L" (" + std::to_wstring(result.error) + L")";
+                MessageBoxW(dialog_owner, message.c_str(), L"Pulse", MB_OK | MB_ICONERROR);
+            }
+            continue;
+        }
+
         if (_wcsicmp(item.open_verb.c_str(), L"__cmdline") == 0) {
             const auto started = GetTickCount64();
             const auto result = LaunchShellCommand(item.open_file, item.open_path, dialog_owner);
@@ -1501,6 +1500,7 @@ void OpsManager::OpenThread() {
 void OpsManager::WorkerThread() {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
+#ifndef PULSE_ELEVATED_HOST
     ipc::ShellClient::Callbacks cb;
     cb.progress = [this](uint32_t, float pct, std::wstring item,
                          uint32_t items_done, uint32_t total_items) {
@@ -1561,6 +1561,7 @@ void OpsManager::WorkerThread() {
         OnCtxItems(id, std::move(out), partial, std::move(slow_clsids));
     };
     ipc::ShellClient::Instance().Start(cb);
+#endif
 
     for (;;) {
         QueueItem item;
@@ -1619,7 +1620,9 @@ void OpsManager::WorkerThread() {
         PersistJournal();
     }
 
+#ifndef PULSE_ELEVATED_HOST
     ipc::ShellClient::Instance().Stop();
+#endif
     CoUninitialize();
 }
 
@@ -1783,6 +1786,9 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
 
     SetStatus([&](OpStatus& st) {
         st.active = true;
+        st.can_pause = true;
+        st.authorization = AuthorizationState::None;
+        st.can_skip_authorization = false;
         st.type = req.type;
         st.task_id = task_id;
         st.phase = OpPhase::Scanning;
@@ -1802,6 +1808,16 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
         st.bytes_per_second = st.peak_bytes_per_second = 0.0;
         st.eta_seconds = 0;
     });
+
+    // Decide before the fast move mutates any source. A whole-request retry
+    // after partial completion could duplicate copies or move items twice.
+#ifndef PULSE_ELEVATED_HOST
+    if (!req.sources.empty() && !req.dest_dir.empty() &&
+        NeedsShellTransfer(req.sources, req.dest_dir, req.type == OpType::Move)) {
+        RunAuthorizedTransfer(req, task_id);
+        return;
+    }
+#endif
 
     std::wstring failure;
     HRESULT failure_hr = S_OK;   // lets a lock-style failure be traced to its owner
@@ -1845,6 +1861,13 @@ void OpsManager::RunTransfer(const OpRequest& req, uint64_t task_id) {
                 return;
             }
             const DWORD move_error = GetLastError();
+#ifndef PULSE_ELEVATED_HOST
+            if (move_error == ERROR_ACCESS_DENIED || move_error == ERROR_PRIVILEGE_NOT_HELD ||
+                move_error == ERROR_ELEVATION_REQUIRED) {
+                RunAuthorizedTransfer(req, task_id);
+                return;
+            }
+#endif
             if (move_error != ERROR_NOT_SAME_DEVICE) {
                 failure_hr = HRESULT_FROM_WIN32(move_error);
                 failure = Win32Message(move_error) + L" | " + req.sources.front();
@@ -2491,6 +2514,9 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
     // Status: active.
     SetStatus([&](OpStatus& st) {
         st.active = true;
+        st.can_pause = true;
+        st.authorization = AuthorizationState::None;
+        st.can_skip_authorization = false;
         st.type = req.type;
         st.task_id = task_id;
         st.phase = OpPhase::Running;
@@ -2531,6 +2557,12 @@ void OpsManager::RunShellOp(const OpRequest& req, uint64_t task_id) {
         SetStatus([](OpStatus& st) { st.phase = OpPhase::Running; st.percent = 0.0f; });
     }
 
+#ifndef PULSE_ELEVATED_HOST
+    if (req.type == OpType::RecycleDelete || req.type == OpType::RealDelete) {
+        RunAuthorizedDelete(req, task_id);
+        return;
+    }
+#endif
     if (req.type == OpType::EmptyRecycle) {
         SHQUERYRBINFO start{};
         start.cbSize = sizeof(start);

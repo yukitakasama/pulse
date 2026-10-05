@@ -329,6 +329,11 @@ struct FluentMenuTestPeer {
 } // namespace pulse::ui
 
 namespace pulse::app {
+struct TabControllerTestAccess {
+    static void Duplicate(TabController& controller, WindowTabs& tabs, size_t index) {
+        controller.DuplicateTab(tabs, index);
+    }
+};
 bool RunPaneHeaderIconTest();
 bool RunFolderSizesTest();
 bool RunColumnResizeUiTest();
@@ -6637,6 +6642,102 @@ void TestStagingTrayDeletion() {
     }
 }
 
+void TestStagingTraySession() {
+    // Each batch nests its own "items" array and paths may contain brackets;
+    // a reload must bring back every batch, not stop at the first ']'.
+    StagingTray tray;
+    tray.Collect({ L"C:\\tray-test\\a]b.txt", L"C:\\tray-test\\c.txt" }, false);
+    tray.Collect({ L"C:\\tray-test\\[x]\\d.txt" }, true);
+    std::wstring tray_json;
+    tray.ToJson(tray_json);
+    SessionSnapshot saved;
+    saved.tray = tray;
+    saved.details_panel = true;
+    const std::wstring json = SessionToJson(saved);
+    wchar_t previous[32768]{};
+    GetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous, ARRAYSIZE(previous));
+    const auto data_dir = WorkspacePath((L"bench_data/tray-session-" + std::to_wstring(GetCurrentProcessId())).c_str());
+    std::filesystem::create_directories(data_dir);
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", data_dir.c_str());
+    SessionSnapshot snap;
+    Check(SaveSession(saved) && LoadSession(snap), L"session: complete file round trip loads");
+    SetEnvironmentVariableW(L"PULSE_TEST_DATA_DIR", previous[0] ? previous : nullptr);
+    std::filesystem::remove_all(data_dir);
+    const auto& batches = snap.tray.batches();
+    Check(batches.size() == 2 && batches[0].items.size() == 2 && !batches[0].move_intent &&
+          batches[0].items[0].path.find(L"a]b.txt") != std::wstring::npos &&
+          batches[1].items.size() == 1 && batches[1].move_intent &&
+          batches[1].items[0].path.find(L"[x]\\d.txt") != std::wstring::npos,
+          L"session: every tray batch survives reload, including bracketed paths");
+    Check(snap.details_panel, L"session: fields after the tray still load");
+    Check(!ParseSessionJson(json.substr(0, json.rfind(L'}')), snap) && snap.tray.batches().size() == 2,
+          L"session: truncated document retains previous tray");
+    Check(!snap.tray.FromJson(tray_json + L"garbage") && snap.tray.batches().size() == 2,
+          L"tray: trailing garbage cannot replace previous batches");
+    Check(!snap.tray.FromJson(L"[{\"move\":false,\"items\":[\"x\"]},]") && snap.tray.batches().size() == 2,
+          L"tray: balanced invalid syntax cannot replace previous batches");
+
+    // A rename or move reported by the completed job also retargets staged
+    // children of the folder, never siblings that only share a name prefix.
+    StagingTray moved;
+    moved.Collect({ L"C:\\tray-test\\dir", L"C:\\tray-test\\dir\\sub\\a.txt",
+                    L"C:\\tray-test\\dir-other\\b.txt" }, true);
+    moved.ReplacePath(L"C:\\tray-test\\dir", L"C:\\tray-test\\renamed");
+    const auto& items = moved.batches()[0].items;
+    Check(items.size() == 3 &&
+          items[0].path == fs::NormalizePath(L"C:\\tray-test\\renamed") &&
+          items[1].path == fs::NormalizePath(L"C:\\tray-test\\renamed\\sub\\a.txt") &&
+          items[2].path.find(L"dir-other") != std::wstring::npos,
+          L"tray: a completed folder rename remaps staged children only");
+    moved.ReplacePath(L"", L"C:\\x");
+    Check(moved.batches()[0].items[0].path == fs::NormalizePath(L"C:\\tray-test\\renamed"),
+          L"tray: an empty source path changes nothing");
+}
+
+void TestAuditTabs() {
+    WindowTabs tabs;
+    auto& first = tabs.NewTab(L"C:\\visible");
+    auto hidden = std::make_unique<Pane>();
+    hidden->NewTab(L"C:\\hidden");
+    auto* hidden_ptr = hidden.get();
+    first.panes.push_back(std::move(hidden));
+    const auto visible = first.VisiblePanes();
+    Check(visible.size() == 1 && visible[0] == first.panes[0].get() &&
+          std::find(visible.begin(), visible.end(), hidden_ptr) == visible.end(),
+          L"AUD-020: cached hidden pane is absent from folder-reuse candidates");
+    first.root = MakePresetTree(LayoutPreset::TwoVertical, {first.panes[0].get(), hidden_ptr});
+    Check(first.VisiblePanes().size() == 2, L"AUD-020: expanding split includes both visible panes");
+
+    WindowTabs duplicate;
+    duplicate.NewTabAtLocation(0, L"");
+    bool loaded_empty = false;
+    bool bound_before_load = false;
+    TabController::Callbacks callbacks;
+    callbacks.default_new_tab = [](std::wstring& path) { path = L"C:\\default"; return true; };
+    callbacks.layout_changed = [&] { bound_before_load = duplicate.Active()->ActiveFolder()->current_path.empty(); };
+    callbacks.load_tab = [&](Tab& tab) { loaded_empty = bound_before_load && tab.current_path.empty(); };
+    TabController controller(callbacks);
+    TabControllerTestAccess::Duplicate(controller, duplicate, 0);
+    Check(duplicate.items.size() == 2 && loaded_empty && duplicate.Active()->ActiveFolder()->current_path.empty(),
+          L"AUD-021: duplicate This PC binds and loads explicit empty location despite default folder setting");
+
+    WindowTabs groups;
+    auto* pinned = &groups.NewTab(L"C:\\pinned");
+    pinned->pinned = true;
+    groups.NewTab(L"C:\\one");
+    groups.NewTab(L"C:\\free");
+    auto* active = &groups.NewTab(L"C:\\two");
+    TabGroup group; group.id = 42; groups.tab_groups.push_back(group);
+    Check(!SetTabGroup(groups, 0, 42) && pinned->tab_group == 0 && groups.items[0].get() == pinned,
+          L"AUD-022: pinned tab rejects group membership without moving prefix");
+    Check(SetTabGroup(groups, 1, 42) && SetTabGroup(groups, 3, 42) &&
+          groups.items[0].get() == pinned && groups.items[0]->pinned &&
+          groups.items[1]->tab_group == 42 && groups.items[2]->tab_group == 42 && groups.Active() == active,
+          L"AUD-022: normal group run stays after pinned prefix and preserves active identity");
+    Check(!SetTabGroup(groups, 99, 42) && !SetTabGroup(groups, 1, 99),
+          L"AUD-022: invalid tab and group leave membership intact");
+}
+
 void TestLayoutOwnedTabs() {
     WindowTabs tabs;
     tabs.NewTab(L"C:\\work");
@@ -6991,6 +7092,13 @@ int RunSelfTest1B2() {
     if (g_skip_visual) LogLine(L"[SKIP] Screenshot capture disabled\n");
     wchar_t test_case[64]{};
     if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"audit-tabs") == 0) {
+        TestAuditTabs();
+        LogLine(L"\n== audit-tabs: %d passed, %d failed ==\n", g_pass, g_fail);
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
         wcscmp(test_case, L"column-resize-ui") == 0) {
         const bool passed = RunColumnResizeUiTest();
         if (g_log) { fclose(g_log); g_log = nullptr; }
@@ -7016,6 +7124,14 @@ int RunSelfTest1B2() {
         TestTrayReveal();
         TestPreviewCodecProbe();
         TestLockedItemPrompt();
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        return g_fail ? 1 : 0;
+    }
+    if (GetEnvironmentVariableW(L"PULSE_SELFTEST_CASE", test_case, ARRAYSIZE(test_case)) &&
+        wcscmp(test_case, L"tray-session") == 0) {
+        TestStagingTrayDeletion();
+        TestStagingTraySession();
+        LogLine(L"\n== tray-session: %d passed, %d failed ==\n", g_pass, g_fail);
         if (g_log) { fclose(g_log); g_log = nullptr; }
         return g_fail ? 1 : 0;
     }
@@ -7202,6 +7318,7 @@ int RunSelfTest1B2() {
     TestSessionLayoutTabs();
     TestTabShortcuts();
     TestStagingTrayDeletion();
+    TestStagingTraySession();
     TestLayoutOwnedTabs();
     TestUtf8PersistFile();
     TestColorPickerModel();

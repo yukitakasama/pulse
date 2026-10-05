@@ -1,5 +1,8 @@
 // app_model.cpp
 #include "app_model.h"
+#include "layout_pane_selection.h"
+#include "network_sidebar.h"
+#include "../common/config_json.h"
 #include "search_query.h"
 #include "entry_group.h"
 #include "../common/json_utils.h"
@@ -570,11 +573,9 @@ std::unique_ptr<LayoutTab> MakeSingleLayoutTab(const std::wstring& path, const T
 
 void RebuildLayoutRoot(LayoutTab& tab) {
     const size_t n = LayoutPresetCount(tab.layout);
-    std::vector<Pane*> used;
-    used.reserve(n);
-    for (size_t i = 0; i < n && i < tab.panes.size(); ++i)
-        used.push_back(tab.panes[i].get());
-    if (used.empty() && !tab.panes.empty()) used.push_back(tab.panes[0].get());
+    std::vector<Pane*> visible;
+    if (tab.root) tab.root->CollectPanes(visible);
+    const auto used = SelectLayoutPanes(tab.panes, tab.FocusedPane(), n, visible);
     tab.root = used.empty() ? nullptr : MakePresetTree(tab.layout, used);
 }
 
@@ -877,9 +878,26 @@ void StagingTray::Collect(const std::vector<std::wstring>& paths, bool move_inte
 
 void StagingTray::ReplacePath(const std::wstring& from, const std::wstring& to) {
     const std::wstring key = fs::NormalizePath(from);
-    for (auto& batch : batches_)
-        for (auto& item : batch.items)
-            if (_wcsicmp(item.path.c_str(), key.c_str()) == 0) item.path = fs::NormalizePath(to);
+    std::wstring target = fs::NormalizePath(to);
+    if (key.empty() || target.empty()) return;
+    for (auto& batch : batches_) {
+        for (auto& item : batch.items) {
+            if (_wcsicmp(item.path.c_str(), key.c_str()) == 0) {
+                item.path = target;
+                continue;
+            }
+            // Items staged from inside a renamed or moved folder follow it.
+            const bool child = item.path.size() > key.size() &&
+                _wcsnicmp(item.path.c_str(), key.c_str(), key.size()) == 0 &&
+                (key.back() == L'\\' || item.path[key.size()] == L'\\');
+            if (!child) continue;
+            std::wstring rest = item.path.substr(key.size());
+            if (rest.empty() || rest.front() != L'\\') rest.insert(rest.begin(), L'\\');
+            std::wstring base = target;
+            while (!base.empty() && base.back() == L'\\') base.pop_back();
+            item.path = base + rest;
+        }
+    }
 }
 
 bool StagingTray::RefreshExists() {
@@ -973,74 +991,33 @@ void StagingTray::ToJson(std::wstring& out) const {
 }
 
 bool StagingTray::FromJson(const std::wstring& in) {
-    batches_.clear();
-    // Minimal parser: enough for our own serialization.
-    size_t i = in.find(L'[');
-    if (i == std::wstring::npos) return false;
-    ++i;
-    while (i < in.size()) {
-        while (i < in.size() && (in[i] == L' ' || in[i] == L'\n' || in[i] == L'\r' || in[i] == L'\t' || in[i] == L',')) ++i;
-        if (i >= in.size() || in[i] == L']') break;
-        if (in[i] != L'{') return false;
-        ++i;
+    if (!pulse::json::ValidConfigArray(in)) return false;
+    std::vector<TrayBatch> parsed;
+    const size_t open = in.find(L'[');
+    if (open == std::wstring::npos) return false;
+    const size_t close = pulse::json::MatchingClose(in, open);
+    if (close == std::wstring::npos) return false;
+    const bool ok = pulse::json::ForEachElement(in.substr(open, close - open + 1), [&](const std::wstring& block) {
+        if (block.empty() || block.front() != L'{') return;
         TrayBatch batch;
-        while (i < in.size() && in[i] != L'}') {
-            while (i < in.size() && (in[i] == L' ' || in[i] == L'\n' || in[i] == L'\r' || in[i] == L'\t' || in[i] == L',')) ++i;
-            size_t keyEnd = in.find(L'"', i + 1);
-            if (keyEnd == std::wstring::npos) return false;
-            std::wstring key = in.substr(i + 1, keyEnd - i - 1);
-            i = keyEnd + 1;
-            while (i < in.size() && in[i] != L':') ++i;
-            if (i >= in.size()) return false;
-            ++i;
-            while (i < in.size() && (in[i] == L' ' || in[i] == L'\n' || in[i] == L'\r' || in[i] == L'\t')) ++i;
-            if (key == L"move") {
-                batch.move_intent = (i + 4 <= in.size() && in.compare(i, 4, L"true") == 0);
-                if (batch.move_intent) i += 4; else i += 5;
-            } else if (key == L"items") {
-                while (i < in.size() && in[i] != L'[') ++i;
-                if (i >= in.size()) return false;
-                ++i;
-                while (i < in.size() && in[i] != L']') {
-                    while (i < in.size() && (in[i] == L' ' || in[i] == L'\n' || in[i] == L'\r' || in[i] == L'\t' || in[i] == L',')) ++i;
-                    if (in[i] != L'"') { ++i; continue; }
-                    ++i;
-                    std::wstring path;
-                    while (i < in.size() && in[i] != L'"') {
-                        if (in[i] == L'\\' && i + 1 < in.size()) {
-                            ++i;
-                            if (in[i] == L'n') path += L'\n';
-                            else if (in[i] == L'r') path += L'\r';
-                            else if (in[i] == L't') path += L'\t';
-                            else path += in[i];
-                        } else {
-                            path += in[i];
-                        }
-                        ++i;
-                    }
-                    if (i < in.size()) ++i;
-                    TrayItem it;
-                    it.path = fs::NormalizePath(path);
-                    WIN32_FILE_ATTRIBUTE_DATA data{};
-                    it.exists = GetFileAttributesExW(it.path.c_str(),
-                        GetFileExInfoStandard, &data) != FALSE;
-                    it.attrs = it.exists ? data.dwFileAttributes : 0;
-                    it.is_dir = it.exists && (it.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                    if (it.exists && !it.is_dir) {
-                        it.size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) |
-                            data.nFileSizeLow;
-                        batch.total_size += it.size;
-                    }
-                    batch.items.push_back(std::move(it));
-                }
-                if (i < in.size()) ++i;
-            } else {
-                while (i < in.size() && in[i] != L',' && in[i] != L'}') ++i;
+        batch.move_intent = pulse::json::ExtractBool(block, L"move");
+        for (const std::wstring& path : pulse::json::ExtractStringArray(block, L"items")) {
+            TrayItem it;
+            it.path = fs::NormalizePath(path);
+            WIN32_FILE_ATTRIBUTE_DATA data{};
+            it.exists = GetFileAttributesExW(it.path.c_str(), GetFileExInfoStandard, &data) != FALSE;
+            it.attrs = it.exists ? data.dwFileAttributes : 0;
+            it.is_dir = it.exists && (it.attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            if (it.exists && !it.is_dir) {
+                it.size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+                batch.total_size += it.size;
             }
+            batch.items.push_back(std::move(it));
         }
-        if (i < in.size()) ++i;
-        if (!batch.items.empty()) batches_.push_back(std::move(batch));
-    }
+        if (!batch.items.empty()) parsed.push_back(std::move(batch));
+    });
+    if (!ok) return false;
+    batches_ = std::move(parsed);
     return true;
 }
 
@@ -1172,6 +1149,28 @@ std::vector<int> NormalizeSidebarOrder(const std::vector<int>& order) {
     return out;
 }
 
+void RefreshSidebarDriveCapacity(std::vector<SidebarEntry>& drives) {
+    DWORD old_mode = 0;
+    const BOOL changed = SetThreadErrorMode(SEM_FAILCRITICALERRORS, &old_mode);
+    for (auto& entry : drives) {
+        ULARGE_INTEGER free_bytes{}, total_bytes{};
+        entry.detail.clear();
+        entry.used_ratio = 0.0f;
+        entry.danger = false;
+        if (!GetDiskFreeSpaceExW(entry.path.c_str(), &free_bytes, &total_bytes, nullptr))
+            continue;
+        const uint64_t total = total_bytes.QuadPart;
+        const uint64_t free = std::min(free_bytes.QuadPart, total_bytes.QuadPart);
+        entry.detail = pulse::format::ByteSize(free, false, pulse::format::ByteSizeStyle::Compact)
+            + L" / " + pulse::format::ByteSize(total, false, pulse::format::ByteSizeStyle::Compact);
+        if (total > 0) {
+            entry.used_ratio = static_cast<float>(static_cast<double>(total - free) / static_cast<double>(total));
+            entry.danger = static_cast<double>(free) / static_cast<double>(total) < 0.10;
+        }
+    }
+    if (changed) SetThreadErrorMode(old_mode, nullptr);
+}
+
 SidebarModel BuildSidebarModel(const fs::RecycleBinInfo* recycle) {
     SidebarModel m;
     // Starred items lead their own section, next to (not inside) quick access.
@@ -1250,27 +1249,17 @@ SidebarModel BuildSidebarModel(const fs::RecycleBinInfo* recycle) {
         wchar_t volName[MAX_PATH + 1] = {};
         DWORD sn = 0;
         GetVolumeInformationW(root, volName, MAX_PATH, &sn, nullptr, nullptr, nullptr, 0);
-        ULARGE_INTEGER freeBytes{}, totalBytes{};
-        GetDiskFreeSpaceExW(root, &freeBytes, &totalBytes, nullptr);
         SidebarEntry e;
         e.label = std::wstring(volName[0] ? volName : l10n::Get(l10n::StringId::LocalDisk).c_str()) +
                   L" (" + root[0] + L":)";
-        uint64_t total = totalBytes.QuadPart;
-        uint64_t free = freeBytes.QuadPart;
-        e.detail = pulse::format::ByteSize(free, false, pulse::format::ByteSizeStyle::Compact)
-                 + L" / " + pulse::format::ByteSize(total, false,
-                                                     pulse::format::ByteSizeStyle::Compact);
         e.glyph = L"\xE7F1"; // HardDrive (Segoe Fluent Icons)
         e.fallback = L"Drive";
         e.path = fs::NormalizePath(std::wstring(root));
         e.is_drive = true;
         e.color = ui::HexColor(kDrivePalette[m.drives.size() % 4]);
-        if (total > 0) {
-            e.used_ratio = (float)((double)(total - free) / (double)total);
-            if ((double)free / (double)total < 0.10) e.danger = true;
-        }
         m.drives.push_back(std::move(e));
     }
+    RefreshSidebarDriveCapacity(m.drives);
     return m;
 }
 
@@ -2035,6 +2024,7 @@ ui::WindowViewModel BuildWindowViewModel(const Pane& pane,
             nets.items.push_back(std::move(it));
         }
     }
+    AppendSystemNetworkLocations(nets, sidebar.system_networks);
     // Emit the sections in the user's order. Ids and the collapse/hide bits are
     // re-applied here because ConvertGroup builds fresh groups.
     vm.sidebar.reserve(sections.size());

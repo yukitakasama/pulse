@@ -31,6 +31,7 @@ struct SlowComExt {
 
 struct ContextMenuPrefs {
     bool persist = true;
+    bool load_failed = false;
 
     // Explorer shows 软件功能 / 打开方式 / 打印 and leaves 发送到 plus the image
     // and system verbs out unless the type registers them; those two groups stay

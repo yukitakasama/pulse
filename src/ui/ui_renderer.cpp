@@ -43,14 +43,18 @@ void MainRenderer::SetCompositor(Compositor* comp) {
     painter_.SetCompositor(comp);
     if (!comp) {
         icon_cache_.Reset();
+        open_with_icons_.Reset();
         thumbnail_cache_.Reset();
+        folder_thumbnail_cache_.Reset();
         details_cache_.Reset();
         preview_handler_.Reset();
         preview_mono_format_.reset();
     }
     else {
         icon_cache_.SetDeviceContext(comp->Dc());
+        open_with_icons_.SetDeviceContext(comp->Dc());
         thumbnail_cache_.SetDeviceContext(comp->Dc());
+        folder_thumbnail_cache_.SetDeviceContext(comp->Dc());
         details_cache_.SetDeviceContext(comp->Dc());
     }
 }
@@ -64,7 +68,9 @@ void MainRenderer::InvalidateTypography() {
 void MainRenderer::SetIconNotifyWindow(HWND hwnd) {
     notify_hwnd_ = hwnd;
     icon_cache_.SetNotifyWindow(hwnd);
+    open_with_icons_.SetNotifyWindow(hwnd);
     thumbnail_cache_.SetNotifyWindow(hwnd);
+    folder_thumbnail_cache_.SetNotifyWindow(hwnd);
     details_cache_.SetNotifyWindow(hwnd);
     preview_handler_.SetNotifyWindow(hwnd);
 }
@@ -498,6 +504,11 @@ void MainRenderer::Render(const WindowViewModel& vm, const D2D1_RECT_F& rect,
                           const Theme& theme) {
     if (!compositor_ || !compositor_->Dc()) return;
     ++motion_frame_;
+    folder_thumbnail_cache_.BeginFrame();
+    struct FolderFrameScope {
+        FolderThumbnailCache& cache;
+        ~FolderFrameScope() { cache.EndFrame(); }
+    } folder_frame{folder_thumbnail_cache_};
     // One timestamp per frame: every glide and the sidebar width agree.
     motion_now_ = motion::NowMs();
     list_loading_active_ = false;
@@ -514,6 +525,7 @@ void MainRenderer::Render(const WindowViewModel& vm, const D2D1_RECT_F& rect,
     }
     ID2D1DeviceContext* dc = compositor_->Dc();
     icon_cache_.SetDeviceContext(compositor_->Dc());
+    open_with_icons_.SetDeviceContext(compositor_->Dc());
     UpdateBrushes(theme);
     text_background_ = theme.bg;
     painter_.BeginFrame(theme, IsHighContrast());

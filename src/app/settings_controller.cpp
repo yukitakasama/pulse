@@ -3,8 +3,12 @@
 #include "settings_controller.h"
 #include "blank_pane_click.h"
 #include "default_file_manager.h"
+#include "shell_integration_registry.h"
 #include "../index/index_client.h"
 #include "../index/network_agent_client.h"
+#include "../common/preview_packs.h"
+#include "pack_catalog.h"
+#include "../ui/quick_preview_command.h"
 
 #include <algorithm>
 #include <array>
@@ -34,6 +38,7 @@ int SettingsController::PageFromName(std::wstring_view name) noexcept {
     if (name == L"context") return 2;
     if (name == L"about") return 3;
     if (name == L"duplicates") return 4;
+    if (name == L"packs") return 5;
     return 0;
 }
 
@@ -42,13 +47,343 @@ const wchar_t* SettingsController::PageName(int page) noexcept {
     if (page == 2) return L"context";
     if (page == 3) return L"about";
     if (page == 4) return L"duplicates";
+    if (page == 5) return L"packs";
     return L"general";
 }
 
 void SettingsController::SelectPage(int page) noexcept {
     CancelGlobalSearchHotkeyCapture();
-    page_ = std::clamp(page, 0, 4);
+    page_ = std::clamp(page, 0, 5);
     scroll_ = 0.0f;
+    packs_checked_ = 0;  // re-read the packs when their page opens
+}
+
+// ---- 预览增强包 ----------------------------------------------------------------
+
+namespace {
+
+uint64_t DirectoryBytes(const std::wstring& directory, int depth = 0) {
+    if (depth > 4) return 0;
+    uint64_t total = 0;
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileExW((directory + L"\\*").c_str(), FindExInfoBasic, &data,
+                                   FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!wcscmp(data.cFileName, L".") || !wcscmp(data.cFileName, L"..")) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            total += DirectoryBytes(directory + L"\\" + data.cFileName, depth + 1);
+        else
+            total += (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    return total;
+}
+
+bool IsFfmpegExe(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    const std::wstring name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    return _wcsicmp(name.c_str(), L"ffmpeg.exe") == 0 && packs::IsRegularFile(path);
+}
+
+} // namespace
+
+void SettingsController::RefreshPacks() {
+    using packs::PackId;
+    PackState state;
+    state.notice = std::move(packs_.notice);
+    state.images_notice = std::move(packs_.images_notice);
+    state.raw_notice = std::move(packs_.raw_notice);
+    const auto raw = packs::ReadInstalledPack(PackId::Raw);
+    state.raw_installed = raw.present;
+    state.raw_version = raw.version;
+    state.archive_notice = std::move(packs_.archive_notice);
+    const auto archive = packs::ReadInstalledPack(PackId::Archives);
+    state.archive_installed = archive.present;
+    state.archive_version = archive.version;
+    state.root = packs::PacksRoot();
+    const packs::PackSettings settings = packs::LoadPackSettings();
+    state.raw_enabled = settings.enabled[static_cast<uint32_t>(PackId::Raw)];
+    state.archive_enabled = settings.enabled[static_cast<uint32_t>(PackId::Archives)];
+    state.media_available = kMediaPackRelease.file_count != 0;
+    state.images_available = kImagePackRelease.file_count != 0;
+    state.raw_available = kRawPackRelease.file_count != 0;
+    state.archive_available = kArchivePackRelease.file_count != 0;
+    state.enabled = settings.enabled[static_cast<uint32_t>(PackId::Media)];
+    state.images_enabled = settings.enabled[static_cast<uint32_t>(PackId::Images)];
+    state.use_custom = settings.use_custom_ffmpeg;
+    state.custom_path = settings.custom_ffmpeg;
+    state.remove_on_uninstall = settings.remove_on_uninstall;
+    const packs::InstalledPack media = packs::ReadInstalledPack(PackId::Media);
+    state.media_installed = media.present;
+    state.version = media.version;
+    const packs::InstalledPack images = packs::ReadInstalledPack(PackId::Images);
+    state.images_installed = images.present;
+    state.images_version = images.version;
+    state.installed = (media.present ? 1u : 0u) + (images.present ? 1u : 0u) + (raw.present ? 1u : 0u) + (archive.present ? 1u : 0u);
+    // What the preview host would use, ignoring the on/off switch so the card
+    // can still say which FFmpeg it is switching.
+    if (state.use_custom) {
+        if (IsFfmpegExe(state.custom_path)) state.ffmpeg = 2;
+    } else if (media.present) state.ffmpeg = 1;
+    wchar_t found[MAX_PATH]{};
+    if (SearchPathW(nullptr, L"ffmpeg.exe", nullptr, MAX_PATH, found, nullptr) && IsFfmpegExe(found))
+        state.detected_path = found;
+    if (!state.root.empty()) state.bytes = DirectoryBytes(state.root);
+    packs_ = std::move(state);
+    packs_checked_ = GetTickCount64();
+    offer_checked_ = 0;
+    image_offer_checked_ = 0;
+}
+
+namespace {
+uint64_t DownloadBytes(const PackRelease& release) {
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < release.file_count; ++i) bytes += release.files[i].packed_size;
+    return bytes;
+}
+} // namespace
+
+void SettingsController::FillMediaPackOffer(ui::MediaPackOffer& offer) {
+    const ULONGLONG now = GetTickCount64();
+    if (!offer_checked_ || now - offer_checked_ >= 2000) {
+        // An installed but switched-off pack is the user's choice: not offered.
+        offer_missing_ = kMediaPackRelease.file_count &&
+            !packs::ReadInstalledPack(packs::PackId::Media).present &&
+            packs::ResolvePack(packs::PackId::Media).source == packs::ToolSource::None;
+        offer_checked_ = now ? now : 1;
+    }
+    offer.installing = media_installer_.running();
+    offer.installable = offer_missing_ || offer.installing;
+    offer.progress = offer.installing ? media_installer_.progress() : 0.0f;
+    offer.download_bytes = DownloadBytes(kMediaPackRelease);
+    offer.notice = offer.installing ? std::wstring{} : packs_.notice;
+}
+
+void SettingsController::FillImagePackOffer(ui::MediaPackOffer& offer) {
+    const ULONGLONG now = GetTickCount64();
+    if (!image_offer_checked_ || now - image_offer_checked_ >= 2000) {
+        image_offer_missing_ = kImagePackRelease.file_count &&
+            !packs::ReadInstalledPack(packs::PackId::Images).present;
+        image_offer_checked_ = now ? now : 1;
+    }
+    offer.installing = image_installer_.running();
+    offer.installable = image_offer_missing_ || offer.installing;
+    offer.progress = offer.installing ? image_installer_.progress() : 0.0f;
+    offer.download_bytes = DownloadBytes(kImagePackRelease);
+    offer.notice = offer.installing ? std::wstring{} : packs_.images_notice;
+}
+
+const SettingsController::PackState& SettingsController::Packs() {
+    if (!packs_checked_ || GetTickCount64() - packs_checked_ >= 2000) RefreshPacks();
+    packs_.installing = media_installer_.running();
+    packs_.progress = packs_.installing ? media_installer_.progress() : 0.0f;
+    packs_.images_installing = image_installer_.running();
+    packs_.images_progress = packs_.images_installing ? image_installer_.progress() : 0.0f;
+    packs_.raw_installing = raw_installer_.running();
+    packs_.raw_progress = packs_.raw_installing ? raw_installer_.progress() : 0.0f;
+    packs_.archive_installing = archive_installer_.running();
+    packs_.archive_progress = packs_.archive_installing ? archive_installer_.progress() : 0.0f;
+    return packs_;
+}
+
+PackInstaller& SettingsController::InstallerFor(packs::PackId id) {
+    switch (id) {
+    case packs::PackId::Images: return image_installer_;
+    case packs::PackId::Raw: return raw_installer_;
+    case packs::PackId::Archives: return archive_installer_;
+    default: return media_installer_;
+    }
+}
+
+std::wstring& SettingsController::NoticeFor(packs::PackId id) {
+    switch (id) {
+    case packs::PackId::Images: return packs_.images_notice;
+    case packs::PackId::Raw: return packs_.raw_notice;
+    case packs::PackId::Archives: return packs_.archive_notice;
+    default: return packs_.notice;
+    }
+}
+
+bool SettingsController::InstallPack(packs::PackId id, HWND notify) {
+    const bool images = id == packs::PackId::Images;
+    PackInstaller& installer = InstallerFor(id);
+    const PackRelease& release = id == packs::PackId::Raw ? kRawPackRelease :
+        id == packs::PackId::Archives ? kArchivePackRelease : images ? kImagePackRelease : kMediaPackRelease;
+    std::wstring& notice = NoticeFor(id);
+    if (installer.running()) {
+        installer.Cancel();
+        return false;
+    }
+    notice.clear();
+    if (!release.file_count) {
+        // No release is advertised until its downloadable files are published.
+        notice = l10n::Pick(L"此预览增强包尚未发布下载。",
+                            L"This preview pack has not been published for download.");
+        return false;
+    }
+    if (!installer.Start(release, notify)) return false;
+    Packs();
+    return false;
+}
+
+bool SettingsController::InstallMediaPack(HWND notify) { return InstallPack(packs::PackId::Media, notify); }
+bool SettingsController::InstallImagePack(HWND notify) { return InstallPack(packs::PackId::Images, notify); }
+
+bool SettingsController::TakePackResult(packs::PackId id) {
+    DWORD error = ERROR_SUCCESS;
+    const PackInstallOutcome outcome = InstallerFor(id).TakeOutcome(error);
+    if (outcome == PackInstallOutcome::None) return false;
+    RefreshPacks();
+    std::wstring& notice = NoticeFor(id);
+    switch (outcome) {
+    case PackInstallOutcome::Installed: {
+        notice.clear();
+        if (id == packs::PackId::Media) {
+            auto settings = packs::LoadPackSettings();
+            settings.use_custom_ffmpeg = false;
+            settings.enabled[0] = true;
+            if (!packs::SavePackSettings(settings)) {
+                notice = l10n::Pick(L"增强包已安装，但未能保存来源设置。请关闭“使用已有 FFmpeg”以切换到增强包。",
+                    L"Pack installed, but the source setting could not be saved. Turn off Use existing FFmpeg to select the pack.");
+            }
+            RefreshPacks();
+        }
+        return true;
+    }
+    case PackInstallOutcome::Cancelled:
+        notice = l10n::Pick(L"已取消下载。", L"Download cancelled.");
+        break;
+    default:
+        if (error == ERROR_INVALID_DATA) {
+            notice = l10n::Pick(L"下载的文件校验失败，已丢弃。请稍后重试。",
+                                L"The download did not pass verification and was discarded. Try again later.");
+        } else if (error == ERROR_SHARING_VIOLATION) {
+            notice = id != packs::PackId::Media
+                ? l10n::Pick(L"旧版本的文件正在使用，请稍后再试一次。",
+                             L"Files of the old version are in use. Try again in a moment.")
+                : l10n::Pick(L"旧版本的文件正在使用。关闭正在播放的视频后再试一次。",
+                             L"Files of the old version are in use. Close playing videos and try again.");
+        } else if (error == ERROR_NOT_SUPPORTED) {
+            notice = l10n::Pick(L"这台电脑缺少解压所需的系统组件，无法安装。",
+                                L"This PC lacks the Windows component needed to unpack the download.");
+        } else {
+            notice = l10n::Pick(L"下载失败，请检查网络后重试。",
+                                L"The download failed. Check the connection and try again.");
+        }
+        break;
+    }
+    return false;
+}
+
+bool SettingsController::TakeMediaPackResult() { return TakePackResult(packs::PackId::Media); }
+bool SettingsController::TakeImagePackResult() { return TakePackResult(packs::PackId::Images); }
+
+bool SettingsController::RemovePack(packs::PackId id) {
+    if (InstallerFor(id).running()) return false;
+    const std::wstring root = packs::PacksRoot();
+    if (root.empty()) return false;
+    const bool removed = RemovePackTree(root + L"\\" + packs::PackKey(id));
+    std::wstring message;
+    if (!removed) {
+        message = id != packs::PackId::Media
+            ? l10n::Pick(L"有文件正在使用，未能全部删除。请稍后再试一次。",
+                         L"Some files are in use and were not removed. Try again in a moment.")
+            : l10n::Pick(L"有文件正在使用，未能全部删除。关闭正在播放的视频后再试一次。",
+                         L"Some files are in use and were not removed. Close playing videos and try again.");
+    }
+    NoticeFor(id) = std::move(message);
+    RefreshPacks();
+    return true;
+}
+
+bool SettingsController::RemoveMediaPack() { return RemovePack(packs::PackId::Media); }
+bool SettingsController::RemoveImagePack() { return RemovePack(packs::PackId::Images); }
+
+namespace {
+bool UpdatePackSettings(const std::function<void(packs::PackSettings&)>& change) {
+    packs::PackSettings settings = packs::LoadPackSettings();
+    change(settings);
+    return packs::SavePackSettings(settings);
+}
+} // namespace
+
+bool SettingsController::ToggleMediaPack() {
+    const bool saved = UpdatePackSettings([](packs::PackSettings& s) { s.enabled[0] = !s.enabled[0]; });
+    packs_.notice.clear();
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::ToggleImagePack() {
+    constexpr uint32_t kImages = static_cast<uint32_t>(packs::PackId::Images);
+    const bool saved = UpdatePackSettings([](packs::PackSettings& s) { s.enabled[kImages] = !s.enabled[kImages]; });
+    packs_.images_notice.clear();
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::InstallRawPack(HWND notify) { return InstallPack(packs::PackId::Raw, notify); }
+bool SettingsController::TakeRawPackResult() { return TakePackResult(packs::PackId::Raw); }
+bool SettingsController::RemoveRawPack() { return RemovePack(packs::PackId::Raw); }
+bool SettingsController::ToggleRawPack() {
+    constexpr uint32_t index = static_cast<uint32_t>(packs::PackId::Raw);
+    const bool saved = UpdatePackSettings([](packs::PackSettings& s) { s.enabled[index] = !s.enabled[index]; });
+    packs_.raw_notice.clear();
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::InstallArchivePack(HWND notify) { return InstallPack(packs::PackId::Archives, notify); }
+bool SettingsController::TakeArchivePackResult() { return TakePackResult(packs::PackId::Archives); }
+bool SettingsController::RemoveArchivePack() { return RemovePack(packs::PackId::Archives); }
+bool SettingsController::ToggleArchivePack() {
+    constexpr uint32_t index = static_cast<uint32_t>(packs::PackId::Archives);
+    const bool saved = UpdatePackSettings([](packs::PackSettings& s) { s.enabled[index] = !s.enabled[index]; });
+    packs_.archive_notice.clear();
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::ToggleCustomFfmpeg() {
+    const std::wstring detected = Packs().detected_path;
+    const bool saved = UpdatePackSettings([&](packs::PackSettings& s) {
+        s.use_custom_ffmpeg = !s.use_custom_ffmpeg;
+        if (s.use_custom_ffmpeg) s.enabled[0] = true;
+        if (s.use_custom_ffmpeg && !packs::IsRegularFile(s.custom_ffmpeg) && !detected.empty())
+            s.custom_ffmpeg = detected;
+    });
+    packs_.notice = saved ? std::wstring{} : l10n::Pick(L"无法保存 FFmpeg 来源设置，请重试。",
+        L"Could not save the FFmpeg source setting. Try again.");
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::SetCustomFfmpeg(const std::wstring& path) {
+    if (!IsFfmpegExe(path)) {
+        packs_.notice = l10n::Pick(L"请选择名为 ffmpeg.exe 的程序。", L"Choose the program named ffmpeg.exe.");
+        return false;
+    }
+    const bool saved = UpdatePackSettings([&](packs::PackSettings& s) {
+        s.custom_ffmpeg = path;
+        s.use_custom_ffmpeg = true;
+        s.enabled[0] = true;
+    });
+    packs_.notice = saved ? std::wstring{} : l10n::Pick(L"无法保存 FFmpeg 来源设置，请重试。",
+        L"Could not save the FFmpeg source setting. Try again.");
+    RefreshPacks();
+    return saved;
+}
+
+bool SettingsController::UseDetectedFfmpeg() {
+    const std::wstring detected = Packs().detected_path;
+    return !detected.empty() && SetCustomFfmpeg(detected);
+}
+
+void SettingsController::ToggleRemovePacksOnUninstall() {
+    UpdatePackSettings([](packs::PackSettings& s) { s.remove_on_uninstall = !s.remove_on_uninstall; });
+    RefreshPacks();
 }
 
 void SettingsController::SetScroll(float value, float maximum) noexcept {
@@ -520,6 +855,9 @@ void SettingsController::IntegrationAction(int index) {
             if (!integration_error_.empty()) integration_error_ += l10n::Pick(L"、", L", ");
             integration_error_ += label;
         };
+        if ((index == 5 || index == 6) && HasLegacyShellIntegrationResidue() &&
+            !RepairLegacyShellIntegrationResidue())
+            failed(l10n::Pick(L"旧版资源管理器关联", L"Legacy Explorer associations"));
         if (!p.ApplyFolderOpen(p.integration_enabled && p.integration_folders))
             failed(l10n::Pick(L"文件夹和磁盘", L"Folders and drives"));
         if (!p.ApplyWinE(p.integration_enabled && p.integration_win_e))
@@ -591,6 +929,9 @@ void SettingsController::ToggleUi(int index) {
         SaveAndApply(SettingsEffect::ListStyle);
     } else if (index == 33) {
         prefs_->list_selection_outline = !prefs_->list_selection_outline;
+        SaveAndApply(SettingsEffect::ListStyle);
+    } else if (index == 34) {
+        prefs_->list_thumbnail_badges = !prefs_->list_thumbnail_badges;
         SaveAndApply(SettingsEffect::ListStyle);
     } else if (index == 23) {
         prefs_->vertical_tabs = !prefs_->vertical_tabs;

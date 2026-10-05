@@ -44,8 +44,6 @@ LayoutTabSnapshot CaptureLayoutTab(const LayoutTab& tab) {
     snapshot.pinned = tab.pinned;
     snapshot.group = tab.tab_group;
     snapshot.layout = static_cast<int>(tab.layout);
-    snapshot.focused = tab.focused_index;
-    snapshot.target = tab.target_index;
     std::vector<Pane*> vis;
     if (tab.root) {
         CollectTreeRatios(*tab.root, snapshot.split_ratios);
@@ -54,6 +52,14 @@ LayoutTabSnapshot CaptureLayoutTab(const LayoutTab& tab) {
         vis.reserve(tab.panes.size());
         for (const auto& pane : tab.panes) vis.push_back(pane.get());
     }
+    // Saved panes are in tree order, while live indices refer to all owned panes.
+    const auto visible_index = [&](int index) {
+        if (index < 0 || static_cast<size_t>(index) >= tab.panes.size()) return -1;
+        const auto found = std::find(vis.begin(), vis.end(), tab.panes[index].get());
+        return found == vis.end() ? -1 : static_cast<int>(found - vis.begin());
+    };
+    snapshot.focused = std::max(0, visible_index(tab.focused_index));
+    snapshot.target = visible_index(tab.target_index);
     snapshot.panes.reserve(vis.size());
     for (const Pane* pane : vis) {
         const Tab* view = pane ? pane->ActiveTab() : nullptr;

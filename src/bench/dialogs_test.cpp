@@ -286,9 +286,9 @@ void TestReader() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     pulse::l10n::Initialize(GetModuleHandleW(nullptr), L"zh-CN");
-    TestConfirm();
+    if (!(argc == 2 && std::string(argv[1]) == "--picker")) TestConfirm();
     TestPickerModel();
     TestReader();
     std::printf("%s (%d failures)\n", g_failures ? "FAILED" : "OK", g_failures);

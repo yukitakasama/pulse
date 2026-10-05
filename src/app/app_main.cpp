@@ -16,7 +16,9 @@
 #include "../ui/file_operation_dialog.h"
 #include "../ui/batch_rename_dialog.h"
 #include "../ui/quick_preview_window.h"
+#include "app_sidebar_refresh.h"
 #include "../ui/typography.h"
+#include "../ui/preview_format_catalog.h"
 #include "../common/crash_reporter.h"
 #include "../common/diagnostics_exporter.h"
 #include "../common/localization.h"
@@ -66,6 +68,7 @@
 #include "../index/network_agent_client.h"
 #include "../index/content_search_client.h"
 #include "../ops/ops_manager.h"
+#include "../ops/elevated_transfer_client.h"
 #include "../ops/clipboard.h"
 #include "../ipc/ctx_menu_util.h"
 #include "../common/text_format.h"
@@ -104,6 +107,27 @@
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "psapi.lib")
 #include "app_internal.h"
+
+namespace {
+// Default-program changes (thumbnail "opens with" badges): one shell-level
+// registration for SHCNE_ASSOCCHANGED on the main window.
+ULONG g_assocNotify = 0;
+
+void RegisterAssocChangeNotify(HWND hwnd) {
+    if (g_assocNotify) return;
+    PIDLIST_ABSOLUTE desktop = nullptr;
+    if (FAILED(SHGetFolderLocation(nullptr, CSIDL_DESKTOP, nullptr, 0, &desktop))) return;
+    SHChangeNotifyEntry entry{desktop, TRUE};
+    g_assocNotify = SHChangeNotifyRegister(hwnd, SHCNRF_ShellLevel, SHCNE_ASSOCCHANGED,
+                                           pulse::WM_ASSOC_CHANGED, 1, &entry);
+    CoTaskMemFree(desktop);
+}
+
+void UnregisterAssocChangeNotify() {
+    if (g_assocNotify) SHChangeNotifyDeregister(g_assocNotify);
+    g_assocNotify = 0;
+}
+} // namespace
 #include "group_wheel_ui.h"
 #include "duplicate_scan.h"
 #include "shell_tag_menu.h"
@@ -415,6 +439,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->renderer.SetCompositor(&s->compositor);
         s->renderer.SetScale(s->scale);
         s->renderer.SetIconNotifyWindow(hwnd);
+        RegisterAssocChangeNotify(hwnd);
         s->quickPreview.Initialize(hwnd, WM_QUICK_PREVIEW_NAVIGATE,
                                    WM_QUICK_PREVIEW_OPEN, WM_QUICK_PREVIEW_COMMAND);
 
@@ -472,7 +497,6 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->update_result.installer_sha256 =
                 L"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         }
-        RefreshSidebarModel(*s);
         ui::typography::SetUiFontScale(s->appPrefs.ui_font_scale);
         ui::typography::InvalidateCaches();
         s->compositor.RecreateTextFormats(s->scale);
@@ -490,6 +514,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                  s->appPrefs.list_selection_outline);
         s->renderer.SetDetailsColumns(s->appPrefs.details_columns);
         s->renderer.SetRowActions(app::RowActionMask(s->ctxMenuPrefs.builtin_hidden));
+        s->renderer.SetThumbnailBadges(s->appPrefs.list_thumbnail_badges);
         app::SetFolderSortMode(app::FolderSortModeFromInt(s->appPrefs.folder_sort_mode));
         ui::typography::SetTextRenderMode(static_cast<ui::typography::TextRenderMode>(s->appPrefs.text_render));
         s->compositor.UpdateTextRenderingParams(nullptr);
@@ -592,8 +617,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         ApplyGlobalSearchSettings(*s);
 
         s->worker.Start([s](app::WorkResult res) { PostWorkerResult(*s, std::move(res)); });
+        RefreshSidebarModel(*s);
         if (s->appPrefs.persist) QueueTagAds(*s, {});
         RequestRecycleOccupancy(*s);
+        RequestNetworkLocations(*s);
 
         // Ops layer: queue worker + shell host IPC; notify repaints the status bar.
         const std::wstring data_dir = app::GetPulseDataDir();
@@ -659,6 +686,12 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         };
         operation_callbacks.resume = [hwnd] {
             if (AppState* state = GetAppState(hwnd)) state->ops.ResumeCurrent();
+        };
+        operation_callbacks.retry_authorization = [hwnd](uint64_t task_id) {
+            if (AppState* state = GetAppState(hwnd)) state->ops.ResolveAuthorization(task_id, true);
+        };
+        operation_callbacks.skip_authorization = [hwnd](uint64_t task_id) {
+            if (AppState* state = GetAppState(hwnd)) state->ops.ResolveAuthorization(task_id, false);
         };
         operation_callbacks.dismiss = [hwnd] {
             if (AppState* state = GetAppState(hwnd)) {
@@ -979,6 +1012,13 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_ACTIVATE:
         if (s) s->renderer.NotifyPreviewActivate(LOWORD(wParam) != WA_INACTIVE);
+        if (s && LOWORD(wParam) != WA_INACTIVE) {
+            std::wstring kind, page;
+            const auto* tab = ActiveTab(*s);
+            if (tab && app::ParsePulsePath(tab->current_path, &kind, &page) && kind == L"settings" &&
+                app::SettingsController::PageFromName(page) == 5)
+                ui::DetectPreviewCodecs(true, hwnd);
+        }
         break;
 
     case WM_ACTIVATEAPP:
@@ -1082,6 +1122,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             DrainDirNotifies(*s);
             const ULONGLONG now = GetTickCount64();
             TickUpdates(*s, now);
+            TickQuickPreviewSelection(*s, now);
+            if (TickSidebarRefresh(*s, now)) dirty = true;
             TickSessionAutosave(*s, hwnd, now);
             if (s->renderer.TickDetailsPreview(now)) dirty = true;
             if (s->renderer.TickMotion(now)) {
@@ -1387,6 +1429,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (wParam == L'\r') return 0; // Alt+Enter handled above; no default beep
         break;
 
+    case WM_CHAR:
+        if (s && HandleListCharacter(*s, static_cast<wchar_t>(wParam))) return 0;
+        break;
+
     case WM_KEYDOWN:
         if (s && HandleGlobalSearchHotkeyCapture(*s, static_cast<UINT>(wParam))) return 0;
         if (s && wParam == VK_ESCAPE && s->detailsPreviewPanning) {
@@ -1426,6 +1472,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    case WM_NETWORK_LOCATIONS:
+        if (s) ApplyNetworkLocations(*s);
+        return 0;
+
     case WM_RECYCLE_INFO: {
         auto* info = reinterpret_cast<fs::RecycleBinInfo*>(lParam);
         if (s && info && ApplyQueriedRecycleInfo(*s, *info))
@@ -1446,6 +1496,7 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
             if (st.completed_ops != s->opsCompleted) {
                 s->opsCompleted = st.completed_ops;
+                RequestSidebarRefresh(*s);
                 std::vector<std::wstring> tag_metadata_paths;
                 for (const auto& completed : s->ops.DrainCompletions()) {
                     // Ask for confirmed index changes on the next tick. Keep any
@@ -1463,6 +1514,9 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         const std::wstring parent = fs::ParentPath(destination);
                         if (!parent.empty()) s->store.MarkDirty(parent);
                     }
+                    for (const auto& directory : completed.refresh_directories)
+                        s->store.MarkDirty(directory);
+                    if (completed.refresh_only) continue;
                     if (completed.type == ops::OpType::Copy) {
                         for (size_t i = 0; i < completed.sources.size() &&
                                            i < completed.destinations.size(); ++i) {
@@ -1477,6 +1531,10 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                            i < completed.destinations.size(); ++i) {
                             s->places.RemapPaths(completed.sources[i],
                                                  completed.destinations[i]);
+                            // Only the items that really moved / were renamed:
+                            // every rename entry (list, tray) leaves the tray
+                            // to this, so failed or cancelled items keep their names.
+                            s->tray.ReplacePath(completed.sources[i], completed.destinations[i]);
                             tag_metadata_paths.push_back(completed.destinations[i]);
                         }
                         if (completed.type == ops::OpType::Move &&
@@ -1598,9 +1656,21 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (s) {
             s->context_menu.InvalidateCaches();
             SeedShellVerbCache(*s);
+            // Broad Classes registry changes also include unrelated shell verbs.
+            // Application badges refresh on SHCNE_ASSOCCHANGED instead.
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     }
+
+    case WM_ASSOC_CHANGED:
+        // Another program (or Settings > Default apps) took over a file type:
+        // resolve the thumbnail badges again. Bursts only bump an epoch.
+        if (s) {
+            s->renderer.InvalidateOpenWithIcons();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
 
     case WM_DETAILS_META: {
         auto* result = reinterpret_cast<DetailsMetaResult*>(lParam);
@@ -1764,8 +1834,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_QUICK_PREVIEW_COMMAND:
-        if (s) HandleQuickPreviewCommand(*s, static_cast<ui::QuickPreviewAction>(wParam),
-                                         (lParam & 1) != 0);
+        if (s) {
+            ui::QuickPreviewCommand command;
+            if (s->quickPreview.TakeCommand(static_cast<UINT_PTR>(lParam), command))
+                HandleQuickPreviewCommand(*s, command);
+        }
         return 0;
 
     case WM_NET_PROBE: {
@@ -1869,6 +1942,8 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             s->networkIndex.Stop();
             s->changes.client.Stop();
             s->index.Stop();
+            CancelNetworkLocations(*s);
+            CancelSidebarRefresh(*s);
             s->worker.Stop();
             ShutdownDetailsSizeWalk(*s);
 
@@ -1916,9 +1991,11 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
             s->tray_controller.Detach();
             s->ops.Stop();
+            ops::ShutdownElevatedTransferHelper();
             app::SweepDropStages(app::DropStageRoot(), true);
             s->single_instance.Release();
 
+            UnregisterAssocChangeNotify();
             s->renderer.SetIconNotifyWindow(nullptr);
             s->renderer.SetCompositor(nullptr);
             s->compositor.Shutdown();
@@ -1953,6 +2030,22 @@ bool WaitForShotReady(AppState& s) {
         ProcessPendingResults(s);
         app::Tab* tab = ActiveTab(s);
         if (tab && !tab->loading && tab->snapshot) {
+            // PULSE_TEST_SHOT_SETTLE_MS: keep pumping after the folder loaded so
+            // asynchronous results (thumbnails from the preview host) land in the shot.
+            wchar_t settle[16]{};
+            if (GetEnvironmentVariableW(L"PULSE_TEST_SHOT_SETTLE_MS", settle, 16)) {
+                const auto until = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds((std::min)(_wtoi(settle), 15000));
+                while (std::chrono::steady_clock::now() < until) {
+                    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    ProcessPendingResults(s);
+                    if (s.hwnd) RedrawWindow(s.hwnd, nullptr, nullptr, RDW_UPDATENOW | RDW_INTERNALPAINT);
+                    Sleep(20);
+                }
+            }
             return true;
         }
         if (s.hwnd) {
@@ -2520,6 +2613,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     }
 
     if (state.shot.active) {
+        wchar_t folder_probe[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_FOLDER_THUMB_FLOW", folder_probe, ARRAYSIZE(folder_probe))) {
+            extern int RunFolderThumbnailProbe(AppState&, const wchar_t*);
+            const int result = WaitForShotReady(state) ? RunFolderThumbnailProbe(state, folder_probe) : 4;
+            DestroyWindow(hwnd);
+            OleUninitialize();
+            return result;
+        }
+        wchar_t selection_probe[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SELECTION_FLOW", selection_probe, ARRAYSIZE(selection_probe))) {
+            extern int RunSelectionInputProbe(AppState&, const wchar_t*);
+            const int result = WaitForShotReady(state) ? RunSelectionInputProbe(state, selection_probe) : 4;
+            DestroyWindow(hwnd);
+            OleUninitialize();
+            return result;
+        }
         wchar_t settings_fixture[32]{};
         if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_EXPANDED",settings_fixture,ARRAYSIZE(settings_fixture)))
             state.settingsExpanded=static_cast<unsigned>(wcstoul(settings_fixture,nullptr,10)) & 0x3f0fu;
@@ -2541,6 +2650,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
         }
 #ifdef PULSE_WITH_SELFTEST
         wchar_t settings_interactions[32768]{};
+        wchar_t quicklook_settings[32768]{};
+        if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_QUICKLOOK_SETTINGS", quicklook_settings, ARRAYSIZE(quicklook_settings))) {
+            extern int RunQuickLookSettingsTest(AppState&, const wchar_t*);
+            const int result = RunQuickLookSettingsTest(state, quicklook_settings);
+            DestroyWindow(hwnd); OleUninitialize(); return result;
+        }
         if (state.isolatedTest && GetEnvironmentVariableW(L"PULSE_TEST_SETTINGS_INTERACTIONS",settings_interactions,ARRAYSIZE(settings_interactions))) {
             extern int RunSettingsInteractionTest(AppState&,const wchar_t*);
             const int result=RunSettingsInteractionTest(state,settings_interactions);

@@ -9,6 +9,7 @@
 #include "../common/json_utils.h"
 #include "../common/config_json.h"
 #include "../common/utf8_file.h"
+#include "../common/runtime_log.h"
 #include <windows.h>
 #include <shlwapi.h>
 #include <shlobj.h>
@@ -67,6 +68,7 @@ void AppPrefs::ResetToDefaults() {
     list_zebra_rows = true;
     list_size_bar = false;
     list_selection_outline = false;
+    list_thumbnail_badges = true;
     folder_sort_mode = 0;
     details_columns = ui::kDetailsColumnsDefault;
     startup_open = 0;
@@ -156,6 +158,8 @@ std::wstring AppPrefs::ToJson() const {
     out += list_tag_name_color ? L"true" : L"false";
     out += L",\n  \"list_selection_outline\":";
     out += list_selection_outline ? L"true" : L"false";
+    out += L",\n  \"list_thumbnail_badges\":";
+    out += list_thumbnail_badges ? L"true" : L"false";
     out += L",\n  \"vertical_tabs\":";
     out += vertical_tabs ? L"true" : L"false";
     out += L",\n  \"sidebar_collapsed\":";
@@ -303,6 +307,7 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     list_size_bar = pulse::json::ExtractBool(json, L"list_size_bar", false);
     list_tag_name_color = pulse::json::ExtractBool(json, L"list_tag_name_color", false);
     list_selection_outline = pulse::json::ExtractBool(json, L"list_selection_outline", false);
+    list_thumbnail_badges = pulse::json::ExtractBool(json, L"list_thumbnail_badges", true);
     vertical_tabs = pulse::json::ExtractBool(json, L"vertical_tabs", false);
     sidebar_collapsed = pulse::json::ExtractBool(json, L"sidebar_collapsed", false);
     folder_sort_mode = pulse::json::ExtractInt(json, L"folder_sort_mode", 0);
@@ -489,12 +494,14 @@ bool AppPrefs::ReadFolderOpen() const {
 
 bool AppPrefs::ReadIntegrationResidual() const {
     const std::wstring exe = ExePath();
-    return HasShellIntegrationOwnership(ShellIntegrationKind::Folders, exe) ||
+    return HasLegacyShellIntegrationResidue() ||
+           HasShellIntegrationOwnership(ShellIntegrationKind::Folders, exe) ||
            HasShellIntegrationOwnership(ShellIntegrationKind::WinE, exe) ||
            HasShellIntegrationOwnership(ShellIntegrationKind::ThisPc, exe);
 }
 
 bool AppPrefs::ReadIntegrationIncomplete() const {
+    if (HasLegacyShellIntegrationResidue()) return true;
     const std::wstring exe = ExePath();
     for (const auto kind : {ShellIntegrationKind::Folders, ShellIntegrationKind::WinE, ShellIntegrationKind::ThisPc})
         if (HasShellIntegrationOwnership(kind, exe) && !ReadShellIntegration(kind, exe)) return true;
@@ -574,6 +581,11 @@ void AppPrefs::MigrateIntegration() {
 }
 
 bool AppPrefs::Load() {
+    if (persist && HasLegacyShellIntegrationResidue()) {
+        const bool repaired = RepairLegacyShellIntegrationResidue();
+        pulse::diagnostics::runtime::Event("shell_integration_legacy_repair", {{"success", repaired ? 1u : 0u}});
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    }
     const std::wstring dir = GetPulseDataDir();
     if (dir.empty()) {
         launch_on_startup = ReadLaunchOnStartup();

@@ -64,6 +64,8 @@ bool SaveSession(const SessionSnapshot& snap);
 std::wstring SessionToJson(const SessionSnapshot& snap);
 bool WriteSessionJson(const std::wstring& json);
 bool LoadSession(SessionSnapshot& snap);
+// LoadSession's parser, for tests.
+bool ParseSessionJson(const std::wstring& json, SessionSnapshot& snap);
 
 std::wstring LayoutTabsToJson(const std::vector<LayoutTabSnapshot>& tabs);
 bool ParseLayoutTabs(const std::wstring& array_json,

@@ -17,6 +17,8 @@ struct FileOperationCallbacks {
     std::function<void()> pause;
     std::function<void()> resume;
     std::function<void()> dismiss;
+    std::function<void(uint64_t)> retry_authorization;
+    std::function<void(uint64_t)> skip_authorization;
 };
 
 class FileOperationWindow {
@@ -33,6 +35,7 @@ public:
     bool IsVisible() const;
 
 private:
+    friend struct FileOperationWindowTestAccess;
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
     LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam);
     void ApplyWindowTheme();

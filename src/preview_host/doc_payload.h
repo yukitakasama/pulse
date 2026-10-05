@@ -2,6 +2,7 @@
 // PULSEMD) from other document formats: DOCX, EPUB, Jupyter notebooks.
 //
 // Records added for converted documents (all optional):
+//   V \t chapters \t loaded \t total  integrity counts, not notebook metadata
 //   M \t format \t a \t b     document facts for the status pill:
 //                             docx: a = word count;  epub: a = title, b = author
 //   P \t title                a section (EPUB chapter) starts; the reader shows

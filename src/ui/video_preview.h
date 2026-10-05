@@ -5,6 +5,7 @@
 #include <string>
 
 namespace pulse::ui {
+struct FfmpegFrame;
 
 // MFPlay is loaded on demand (including on Windows N without Media Foundation).
 // All media/provider calls run off the UI thread. Each open has its own mailbox,
@@ -30,16 +31,22 @@ public:
         // The video track's format has no installed decoder (e.g. HEVC without
         // the Store extension): MFPlay would only play the sound.
         bool missing_decoder = false;
+        bool unsupported_audio = false; // Media Foundation rejected the container or codec.
         std::wstring codec;       // short name ("HEVC"), set with missing_decoder
         std::wstring codec_name;  // display name ("HEVC (H.265)")
         const wchar_t* store_id = nullptr;  // Microsoft Store extension, if any
+        // Playing through the FFmpeg preview pack (Media Foundation could not).
+        bool ffmpeg = false;
     };
     VideoPreview() = default;
     ~VideoPreview();
     VideoPreview(const VideoPreview&) = delete;
     VideoPreview& operator=(const VideoPreview&) = delete;
-    // Video and audio files MFPlay can open; audio-only files never show the
-    // video child window (the Quick Look draws cover art and a waveform).
+    // Candidate video/audio extensions; actual support depends on installed
+    // Media Foundation sources and decoders, plus the formats the FFmpeg
+    // preview pack adds while it is installed and enabled. Audio-only files
+    // never show the video child window (the Quick Look draws cover art and a
+    // waveform).
     static bool Supports(const std::wstring& path);
     static bool IsAudio(const std::wstring& path);
     void Open(HWND owner, const std::wstring& path);
@@ -53,10 +60,16 @@ public:
     void SetMuted(bool muted);
     void SetRate(float rate);
     State Snapshot() const;
+    // FFmpeg playback (State::ffmpeg): the picture for the owner to draw, already
+    // scaled for it; serial changes with every new frame.
+    std::shared_ptr<const FfmpegFrame> Frame(uint64_t& serial) const;
     bool active() const noexcept { return state_ != nullptr; }
 private:
     struct Shared;
     static void Run(std::shared_ptr<Shared> state, std::wstring path);
+    // Playback through the pack's ffmpeg; false when it cannot read the file.
+    static bool RunFfmpeg(const std::shared_ptr<Shared>& state, const std::wstring& path,
+                          const std::wstring& ffmpeg);
     static LRESULT CALLBACK VideoProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
     std::shared_ptr<Shared> state_;
     HWND child_ = nullptr;

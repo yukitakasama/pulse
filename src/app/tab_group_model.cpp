@@ -5,6 +5,15 @@
 
 namespace pulse::app {
 
+bool SetTabGroup(WindowTabs& tabs, size_t index, int group) {
+    if (index >= tabs.items.size() || (tabs.items[index]->pinned && group != 0)) return false;
+    if (group != 0 && std::none_of(tabs.tab_groups.begin(), tabs.tab_groups.end(),
+        [group](const TabGroup& value) { return value.id == group; })) return false;
+    tabs.items[index]->tab_group = group;
+    NormalizeGroupRuns(tabs);
+    return true;
+}
+
 int MoveTabRun(std::vector<int>& order, int pos, int len, int dir) {
     const int n = static_cast<int>(order.size());
     if (pos < 0 || len < 1 || pos + len > n) return pos;

@@ -28,6 +28,7 @@ enum class PreviewFamily {
     Archive,
     Psd,
     Font,
+    Raw,
 };
 
 namespace formats {
@@ -45,6 +46,21 @@ inline constexpr std::wstring_view kText[] = {
 inline constexpr std::wstring_view kImage[] = {
     L".jpg", L".jpeg", L".png", L".gif", L".bmp", L".tif", L".tiff",
     L".webp", L".heic", L".heif", L".hif", L".avif", L".ico", L".cur"
+};
+
+inline constexpr std::wstring_view kRaw[] = {
+    L".cr2", L".cr3", L".crw", L".nef", L".nrw", L".arw", L".sr2",
+    L".dng", L".raf", L".orf", L".rw2", L".pef", L".srw", L".rwl"
+};
+
+// Media families describe file categories; decoder availability remains backend-specific.
+inline constexpr std::wstring_view kVideo[] = {
+    L".mp4", L".m4v", L".mov", L".wmv", L".avi", L".mkv", L".webm",
+    L".mpg", L".mpeg", L".m2ts", L".mts", L".3gp"
+};
+inline constexpr std::wstring_view kAudio[] = {
+    L".mp3", L".wav", L".flac", L".m4a", L".aac", L".wma", L".ogg",
+    L".oga", L".opus", L".aif", L".aiff"
 };
 
 // Vector documents WIC cannot decode but Direct2D renders natively. They are
@@ -67,7 +83,8 @@ inline constexpr std::wstring_view kPdfRaster[] = { L".pdf", L".ai" };
 // directory, the rest through the system's libarchive (archiveint.dll).
 inline constexpr std::wstring_view kArchive[] = {
     L".zip", L".7z", L".rar", L".tar", L".tgz", L".gz", L".txz", L".xz",
-    L".tbz2", L".bz2", L".cab", L".iso"
+    L".tbz2", L".bz2", L".cab", L".iso", L".wim", L".swm", L".esd", L".001", L".zipx", L".vhd", L".vhdx", L".vdi", L".vmdk",
+    L".dmg", L".xar", L".rpm", L".deb", L".arj", L".lzh", L".lha", L".chm", L".udf"
 };
 
 // Photoshop documents: the merged composite (or the embedded JPEG thumbnail)
@@ -93,6 +110,7 @@ inline constexpr PreviewFormat kPreviewFormats[] = {
     { PreviewFamily::PdfRaster, formats::kPdfRaster, std::size(formats::kPdfRaster) },
     { PreviewFamily::Archive,   formats::kArchive,   std::size(formats::kArchive) },
     { PreviewFamily::Psd,       formats::kPsd,       std::size(formats::kPsd) },
+    { PreviewFamily::Raw,       formats::kRaw,       std::size(formats::kRaw) },
     { PreviewFamily::Font,      formats::kFont,      std::size(formats::kFont) },
 };
 
@@ -118,6 +136,15 @@ inline bool IsTextExtension(std::wstring_view extension) {
 
 inline bool IsImageExtension(std::wstring_view extension) {
     return IsFamilyExtension(PreviewFamily::Image, extension);
+}
+
+inline bool IsVideoExtension(std::wstring_view extension) {
+    for (const auto value : formats::kVideo) if (value == extension) return true;
+    return false;
+}
+inline bool IsAudioExtension(std::wstring_view extension) {
+    for (const auto value : formats::kAudio) if (value == extension) return true;
+    return false;
 }
 
 inline bool IsVectorExtension(std::wstring_view extension) {

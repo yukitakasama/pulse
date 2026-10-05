@@ -1,0 +1,273 @@
+#include "ffmpeg_tool.h"
+#include "path_utils.h"
+#include "preview_packs.h"
+#include <algorithm>
+#include <iterator>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <initializer_list>
+#include <vector>
+
+namespace pulse::ffmpeg {
+
+bool IsVideoExtension(std::wstring_view e) {
+    return std::find(std::begin(kVideoExtensions), std::end(kVideoExtensions), e) != std::end(kVideoExtensions);
+}
+
+bool IsAudioExtension(std::wstring_view e) {
+    return std::find(std::begin(kAudioExtensions), std::end(kAudioExtensions), e) != std::end(kAudioExtensions);
+}
+
+std::wstring QuoteArgument(const std::wstring& argument) {
+    if (!argument.empty() && argument.find_first_of(L" \t\n\v\"") == std::wstring::npos) return argument;
+    std::wstring out = L"\"";
+    for (size_t i = 0;; ++i) {
+        size_t slashes = 0;
+        while (i < argument.size() && argument[i] == L'\\') { ++i; ++slashes; }
+        if (i == argument.size()) { out.append(slashes * 2, L'\\'); break; }
+        if (argument[i] == L'"') { out.append(slashes * 2 + 1, L'\\'); out += L'"'; }
+        else { out.append(slashes, L'\\'); out += argument[i]; }
+    }
+    out += L'"';
+    return out;
+}
+
+std::wstring InputArgument(const std::wstring& path) {
+    std::wstring plain = path.size() < MAX_PATH ? path::StripExtendedPathPrefix(path) : path;
+    return L"file:" + plain;
+}
+
+Process::~Process() {
+    Terminate();
+    if (out_) CloseHandle(out_);
+    if (err_) CloseHandle(err_);
+    if (process_) CloseHandle(process_);
+    if (job_) CloseHandle(job_);
+}
+
+bool Process::Start(const std::wstring& exe, const std::wstring& arguments, const LaunchOptions& options) {
+    if (process_) return false;
+    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    HANDLE out_write = nullptr, err_write = nullptr;
+    if (!CreatePipe(&out_, &out_write, &inherit, options.stdout_buffer)) return false;
+    if (!CreatePipe(&err_, &err_write, &inherit, 64 * 1024)) {
+        CloseHandle(out_write);
+        return false;
+    }
+    SetHandleInformation(out_, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(err_, HANDLE_FLAG_INHERIT, 0);
+    HANDLE null_in = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 &inherit, OPEN_EXISTING, 0, nullptr);
+    if (null_in == INVALID_HANDLE_VALUE) {
+        CloseHandle(out_write);
+        CloseHandle(err_write);
+        return false;
+    }
+    if (options.discard_stderr) {
+        CloseHandle(err_write);
+        CloseHandle(err_);
+        err_ = nullptr;
+        err_write = null_in;
+    }
+
+    // Only the three standard handles are inherited, never a caller's pipe.
+    HANDLE inherited[3] = {null_in, out_write, err_write};
+    const DWORD inherited_count = err_write == null_in ? 2 : 3;
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+    std::vector<uint8_t> attr_storage(attr_size);
+    auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_storage.data());
+    const bool attrs_ok = InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
+        UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
+                                  inherited_count * sizeof(HANDLE), nullptr, nullptr);
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = null_in;
+    si.StartupInfo.hStdOutput = out_write;
+    si.StartupInfo.hStdError = err_write;
+    si.lpAttributeList = attrs_ok ? attrs : nullptr;
+
+    job_ = CreateJobObjectW(nullptr, nullptr);
+    if (job_) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+            JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION | JOB_OBJECT_LIMIT_ACTIVE_PROCESS |
+            (options.memory_limit ? JOB_OBJECT_LIMIT_PROCESS_MEMORY : 0);
+        limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        limits.ProcessMemoryLimit = options.memory_limit;
+        SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+    }
+
+    std::wstring command = QuoteArgument(exe) + L" " + arguments;
+    PROCESS_INFORMATION pi{};
+    const DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | options.priority |
+        CREATE_UNICODE_ENVIRONMENT | (attrs_ok ? EXTENDED_STARTUPINFO_PRESENT : 0);
+    const std::wstring directory = packs::DirectoryOf(exe);
+    const bool started = CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, flags, nullptr,
+                                        directory.empty() ? nullptr : directory.c_str(),
+                                        &si.StartupInfo, &pi) != FALSE;
+    const DWORD error = GetLastError();
+    if (attrs_ok) DeleteProcThreadAttributeList(attrs);
+    CloseHandle(out_write);
+    if (err_write != null_in) CloseHandle(err_write);
+    CloseHandle(null_in);
+    if (!started) {
+        CloseHandle(out_); out_ = nullptr;
+        if (err_) { CloseHandle(err_); err_ = nullptr; }
+        if (job_) { CloseHandle(job_); job_ = nullptr; }
+        SetLastError(error);
+        return false;
+    }
+    if (job_ && !AssignProcessToJobObject(job_, pi.hProcess)) {
+        // Nested-job restrictions on old systems: Terminate still works.
+        CloseHandle(job_);
+        job_ = nullptr;
+    }
+    process_ = pi.hProcess;
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    return true;
+}
+
+DWORD Process::ReadOut(void* buffer, DWORD size) {
+    DWORD got = 0;
+    if (!out_ || !ReadFile(out_, buffer, size, &got, nullptr)) return 0;
+    return got;
+}
+
+DWORD Process::ReadErr(void* buffer, DWORD size) {
+    DWORD got = 0;
+    if (!err_ || !ReadFile(err_, buffer, size, &got, nullptr)) return 0;
+    return got;
+}
+
+bool Process::ReadOutExact(void* buffer, DWORD size) {
+    auto* p = static_cast<uint8_t*>(buffer);
+    while (size) {
+        const DWORD got = ReadOut(p, size);
+        if (!got) return false;
+        p += got;
+        size -= got;
+    }
+    return true;
+}
+
+bool Process::Wait(DWORD timeout_ms) {
+    return process_ && WaitForSingleObject(process_, timeout_ms) == WAIT_OBJECT_0;
+}
+
+void Process::Terminate(DWORD code) {
+    if (!process_) return;
+    if (WaitForSingleObject(process_, 0) == WAIT_OBJECT_0) return;
+    if (job_) TerminateJobObject(job_, code);
+    else TerminateProcess(process_, code);
+    WaitForSingleObject(process_, 2000);
+}
+
+DWORD Process::ExitCode() const {
+    DWORD code = STILL_ACTIVE;
+    if (process_) GetExitCodeProcess(process_, &code);
+    return code;
+}
+
+uint32_t ParseDurationMs(std::string_view log) {
+    const size_t at = log.find("Duration: ");
+    if (at == std::string_view::npos) return 0;
+    unsigned h = 0, m = 0, s = 0, frac = 0;
+    char buffer[24]{};
+    const std::string_view value = log.substr(at + 10, 16);
+    std::copy(value.begin(), value.end(), buffer);
+    int digits = 0;
+    if (sscanf_s(buffer, "%u:%u:%u.%n", &h, &m, &s, &digits) < 3) return 0;
+    // Fraction is hundredths in ffmpeg's log ("12.34").
+    const char* f = buffer + digits;
+    if (digits > 0 && f[0] >= '0' && f[0] <= '9') {
+        frac = (f[0] - '0') * 100u;
+        if (f[1] >= '0' && f[1] <= '9') frac += (f[1] - '0') * 10u;
+    }
+    if (m >= 60 || s >= 60) return 0;
+    const unsigned long long ms = ((h * 60ull + m) * 60ull + s) * 1000ull + frac;
+    return static_cast<uint32_t>((std::min)(ms, 0xFFFFFFFFull));
+}
+
+namespace {
+// Lines of real video streams (cover art excluded).
+template <typename F>
+bool ForEachVideoLine(std::string_view log, F&& visit) {
+    size_t at = log.find("Video: ");
+    while (at != std::string_view::npos) {
+        const size_t end = log.find('\n', at);
+        const std::string_view line = log.substr(at, end == std::string_view::npos ? std::string_view::npos : end - at);
+        if (line.find("(attached pic)") == std::string_view::npos && visit(line)) return true;
+        at = log.find("Video: ", at + 7);
+    }
+    return false;
+}
+} // namespace
+
+bool ParseVideoSize(std::string_view log, UINT& width, UINT& height) {
+    return ForEachVideoLine(log, [&](std::string_view line) {
+        // The size token is digits 'x' digits, delimited by space/comma.
+        for (size_t i = 1; i + 2 < line.size(); ++i) {
+            if (line[i] != 'x' || !isdigit(static_cast<unsigned char>(line[i - 1])) ||
+                !isdigit(static_cast<unsigned char>(line[i + 1]))) continue;
+            size_t a = i; while (a > 0 && isdigit(static_cast<unsigned char>(line[a - 1]))) --a;
+            size_t b = i + 1; while (b < line.size() && isdigit(static_cast<unsigned char>(line[b]))) ++b;
+            if (a == 0 || line[a - 1] != ' ') continue;
+            if (b < line.size() && line[b] != ' ' && line[b] != ',') continue;
+            const UINT w = static_cast<UINT>(strtoul(std::string(line.substr(a, i - a)).c_str(), nullptr, 10));
+            const UINT h = static_cast<UINT>(strtoul(std::string(line.substr(i + 1, b - i - 1)).c_str(), nullptr, 10));
+            if (w > 0 && h > 0 && w <= 65535 && h <= 65535) { width = w; height = h; return true; }
+        }
+        return false;
+    });
+}
+
+double ParseFrameRate(std::string_view log) {
+    double rate = 0;
+    ForEachVideoLine(log, [&](std::string_view line) {
+        for (const char* unit : {" fps", " tbr"}) {
+            const size_t at = line.find(unit);
+            if (at == std::string_view::npos) continue;
+            size_t a = at;
+            while (a > 0 && (isdigit(static_cast<unsigned char>(line[a - 1])) || line[a - 1] == '.' ||
+                             line[a - 1] == 'k')) --a;
+            std::string number(line.substr(a, at - a));
+            double value = strtod(number.c_str(), nullptr);
+            if (!number.empty() && number.back() == 'k') value *= 1000.0;
+            if (value > 0.5 && value < 1000.0) { rate = value; return true; }
+        }
+        return false;
+    });
+    return rate;
+}
+
+void ParseSampleAspect(std::string_view log, UINT& num, UINT& den) {
+    num = den = 1;
+    ForEachVideoLine(log, [&](std::string_view line) {
+        const size_t at = line.find("SAR ");
+        if (at == std::string_view::npos) return true;   // first video stream only
+        unsigned a = 0, b = 0;
+        const std::string token(line.substr(at + 4, 16));
+        if (sscanf_s(token.c_str(), "%u:%u", &a, &b) == 2 && a && b && a < 100000 && b < 100000) {
+            num = a;
+            den = b;
+        }
+        return true;
+    });
+}
+
+bool HasStream(std::string_view log, std::string_view kind) {
+    if (kind == "Video") return ForEachVideoLine(log, [](std::string_view) { return true; });
+    const std::string needle = std::string(kind) + ": ";
+    for (size_t at = log.find("Stream #"); at != std::string_view::npos; at = log.find("Stream #", at + 8)) {
+        const size_t end = log.find('\n', at);
+        if (log.substr(at, end == std::string_view::npos ? std::string_view::npos : end - at).find(needle) !=
+            std::string_view::npos) return true;
+    }
+    return false;
+}
+
+} // namespace pulse::ffmpeg

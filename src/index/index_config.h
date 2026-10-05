@@ -30,6 +30,7 @@ struct VolumeInfo {
 };
 
 struct IndexConfig {
+    bool load_failed = false;
     uint32_t version = 1;
     uint64_t generation = 1;
     bool include_fixed_ntfs = true;
@@ -52,6 +53,8 @@ bool ProtectIndexDirectory(const std::wstring& path);
 std::wstring UserIndexRoot();
 std::wstring MachineConfigPath();
 
+bool LoadIndexConfigFrom(const std::wstring& path, const std::wstring& default_index_path,
+                         IndexConfig& config, std::wstring* error = nullptr);
 bool LoadMachineConfig(IndexConfig& config, std::wstring* error = nullptr);
 bool SaveMachineConfig(const IndexConfig& config, std::wstring* error = nullptr);
 bool ConfigureVolume(const std::wstring& id, bool enabled, std::wstring* error = nullptr);

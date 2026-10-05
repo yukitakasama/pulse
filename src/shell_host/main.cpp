@@ -502,7 +502,8 @@ void ExecuteRequest(Request* req) {
 #else
         constexpr DWORD kDontDisplayUi = FOFX_DONTDISPLAYUI;
 #endif
-        DWORD flags = FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | kDontDisplayUi;
+        DWORD flags = FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | kDontDisplayUi |
+            FOFX_SHOWELEVATIONPROMPT;
         if (req->type != REQ_REALDELETE) flags |= FOF_ALLOWUNDO;
         if (req->type == REQ_DELETE_RECYCLE) flags |= FOFX_RECYCLEONDELETE;
         op->SetOperationFlags(flags);

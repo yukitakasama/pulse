@@ -10,6 +10,7 @@ class ConfigSyntax {
 public:
     ConfigSyntax(std::wstring_view text, bool legacy_hex) : text_(text), hex_(legacy_hex) {}
     bool Object() { Space(); if (Peek() != L'{') return false; return Value(0) && (Space(), pos_ == text_.size()); }
+    bool Array() { Space(); if (Peek() != L'[') return false; return Value(0) && (Space(), pos_ == text_.size()); }
 private:
     wchar_t Peek() const { return pos_ < text_.size() ? text_[pos_] : L'\0'; }
     void Space() { while (Peek() == L' ' || Peek() == L'\r' || Peek() == L'\n' || Peek() == L'\t') ++pos_; }
@@ -75,5 +76,8 @@ private:
 
 inline bool ValidConfigObject(std::wstring_view text, bool legacy_hex = false) {
     return ConfigSyntax(text, legacy_hex).Object();
+}
+inline bool ValidConfigArray(std::wstring_view text) {
+    return ConfigSyntax(text, false).Array();
 }
 } // namespace pulse::json

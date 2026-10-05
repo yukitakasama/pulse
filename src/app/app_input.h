@@ -4,6 +4,8 @@
 
 namespace pulse {
 bool HandleBrowserNavigation(AppState& s, LPARAM command);
+bool HandleListCharacter(AppState& s, wchar_t ch);
+void TickQuickPreviewSelection(AppState& s, ULONGLONG now);
 bool HandleDetailsPreviewPointer(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT HandleMouseMove(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT HandleMouseLeave(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

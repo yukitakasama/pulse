@@ -180,6 +180,45 @@ void DropEmptyKeys(std::wstring key) {
     }
 }
 
+bool LegacyResidue(std::vector<Binding>& bindings, std::vector<Value>& current) {
+    bindings.clear();
+    current.clear();
+    for (const auto* group : {L"Directory", L"Drive", L"WinE", L"ThisPc"}) {
+        const auto group_bindings = Bindings(group, L"");
+        HKEY backup = nullptr;
+        const auto status = RegOpenKeyExW(HKEY_CURRENT_USER, (std::wstring(kBackupRoot) + group).c_str(),
+                                         0, KEY_QUERY_VALUE, &backup);
+        if (backup) RegCloseKey(backup);
+        if (status != ERROR_FILE_NOT_FOUND && status != ERROR_PATH_NOT_FOUND) return false;
+        for (size_t i = 0; i < group_bindings.size(); ++i) {
+            const auto& binding = group_bindings[i];
+            Value actual, legacy;
+            if (!Read(binding.key, binding.name, actual)) return false;
+            const bool absent = i == 0 || (i == 1 && (group == std::wstring_view(L"Directory") ||
+                                                                     group == std::wstring_view(L"Drive")));
+            if (!SameValue(actual, absent ? Value{} : binding.desired)) return false;
+            for (const auto* name : {L"PulseBackup", L"PulseBackupDelegateExecute"})
+                if (!Read(binding.key, name, legacy) || legacy.exists) return false;
+            bindings.push_back(binding);
+            current.push_back(std::move(actual));
+        }
+        // The legacy namespace shape has no delegate on the verb itself.
+        if (group == std::wstring_view(L"WinE") || group == std::wstring_view(L"ThisPc")) {
+            auto verb = group_bindings.front().key;
+            verb.resize(verb.rfind(L'\\'));
+            Value value;
+            for (const auto* name : {L"DelegateExecute", L"PulseBackup", L"PulseBackupDelegateExecute"})
+                if (!Read(verb, name, value) || value.exists) return false;
+            if (group == std::wstring_view(L"WinE")) {
+                verb.resize(verb.rfind(L'\\'));
+                for (const auto* name : {L"", L"PulseBackup", L"PulseBackupDelegateExecute"})
+                    if (!Read(verb, name, value) || value.exists) return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool ApplyGroup(const std::wstring& group, const std::wstring& exe, bool on) {
     const auto bindings = Bindings(group, exe);
     std::vector<Value> current(bindings.size());
@@ -294,6 +333,9 @@ bool ShellCommandTargetsExecutable(const std::wstring& command, const std::wstri
 
 bool ApplyShellIntegration(ShellIntegrationKind kind, const std::wstring& exe, bool on) {
     if (exe.empty()) return false;
+    // Do not record damaged legacy overrides as the next "original" state.
+    // The explicit repair action must release them before enabling again.
+    if (on && HasLegacyShellIntegrationResidue()) return false;
     bool ok = true;
     for (const auto& group : Groups(kind)) ok = ApplyGroup(group, exe, on) && ok;
     return ok;
@@ -313,11 +355,65 @@ bool ReadShellIntegration(ShellIntegrationKind kind, const std::wstring& exe) {
 bool HasShellIntegrationOwnership(ShellIntegrationKind kind, const std::wstring& exe) {
     if (exe.empty()) return false;
     for (const auto& group : Groups(kind)) {
-        const auto binding = Bindings(group, exe).front();
+        const auto bindings = Bindings(group, exe);
+        const auto& binding = bindings.front();
         Value actual;
-        if (Read(binding.key, binding.name, actual) && ShellCommandTargetsExecutable(Text(actual), exe)) return true;
+        if (!Read(binding.key, binding.name, actual)) continue;
+        if (ShellCommandTargetsExecutable(Text(actual), exe)) return true;
+        if (actual.exists) continue;
+        Value stored;
+        Snapshot snapshot;
+        if (!Read(std::wstring(kBackupRoot) + group, L"Snapshot", stored) ||
+            !Decode(stored, bindings.size(), snapshot) || snapshot.before[0].exists ||
+            !ShellCommandTargetsExecutable(Text(snapshot.written[0]), exe)) continue;
+        // A previous restore may have removed the command first. Keep repair
+        // available while a snapshot-proven override still masks Explorer.
+        for (size_t i = 1; i < bindings.size(); ++i) {
+            if (Read(bindings[i].key, bindings[i].name, actual) && actual.exists &&
+                SameValue(actual, snapshot.written[i]) &&
+                !SameValue(actual, snapshot.before[i])) return true;
+        }
     }
     return false;
+}
+
+bool HasLegacyShellIntegrationResidue() {
+    std::vector<Binding> bindings;
+    std::vector<Value> current;
+    return LegacyResidue(bindings, current);
+}
+
+bool RepairLegacyShellIntegrationResidue() {
+    std::vector<Binding> bindings;
+    std::vector<Value> current;
+    if (!LegacyResidue(bindings, current)) return false;
+    // Retain an exact backup before deleting anything. Never overwrite an
+    // earlier repair record, including after an interrupted repair.
+    const std::wstring backup_key = std::wstring(kBackupRoot) + L"LegacyOrphanRepair";
+    const Value encoded = Encode(Snapshot{current, std::vector<Value>(current.size())});
+    Value existing;
+    if (!Read(backup_key, L"Snapshot", existing) ||
+        (existing.exists && !SameValue(existing, encoded)) ||
+        (!existing.exists && !Write(backup_key, L"Snapshot", encoded))) return false;
+    std::vector<Binding> checked_bindings;
+    std::vector<Value> checked;
+    if (!LegacyResidue(checked_bindings, checked) || checked != current) return false;
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        if (!current[i].exists) continue;
+        Value actual;
+        if (!Read(bindings[i].key, bindings[i].name, actual) || !SameValue(actual, current[i]) ||
+            !Write(bindings[i].key, bindings[i].name, Value{})) {
+            // A failed repair must not strand a new partial pattern that no
+            // longer satisfies the conservative full-signature check.
+            for (size_t j = 0; j <= i; ++j) {
+                if (current[j].exists && Read(bindings[j].key, bindings[j].name, actual) && !actual.exists)
+                    Write(bindings[j].key, bindings[j].name, current[j]);
+            }
+            return false;
+        }
+    }
+    for (const auto& binding : bindings) DropEmptyKeys(binding.key);
+    return true;
 }
 
 bool PrepareShellIntegrationUpgrade(ShellIntegrationKind kind, const std::wstring& exe) {

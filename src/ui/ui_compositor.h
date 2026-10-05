@@ -84,7 +84,9 @@ public:
                          const D2D1_COLOR_F& foreground, const D2D1_COLOR_F& background);
     LRESULT CallLumaEditMouse(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                               IDWriteTextFormat* format);
-    bool LumaTextEnabled() const noexcept;
+    bool LumaTextAvailable() const noexcept;
+    bool LumaTextEnabled() const noexcept; // Selected UI backend, including accessibility policy.
+    bool CustomEditEnabled() const noexcept; // DirectWrite input surfaces in all text modes.
     const LumaTextStats* GetLumaTextStats() const noexcept;
 
     int Width() const { return width_; }

@@ -260,13 +260,24 @@ bool ContextMenuController::ExecuteShellCommand(
         const int packed = command - CmdShellStaticBase;
         const size_t index = static_cast<size_t>(packed / ipc::kStaticVerbStride);
         const int child = packed % ipc::kStaticVerbStride;
-        if (index < static_verbs_.size()) {
-            const StaticVerb* verb = &static_verbs_[index];
+        if (index < menu_static_verbs_.size()) {
+            const StaticVerb* verb = &menu_static_verbs_[index];
+            const auto same = [](const StaticVerb& a, const StaticVerb& b) {
+                return a.verb == b.verb && a.command == b.command &&
+                       a.app_path == b.app_path && a.display == b.display;
+            };
+            const auto live = std::find_if(static_verbs_.begin(), static_verbs_.end(),
+                [&](const StaticVerb& candidate) { return same(*verb, candidate); });
             if (child > 0) {
                 const size_t ci = static_cast<size_t>(child - 1);
                 if (ci < verb->children.size()) verb = &verb->children[ci];
                 else verb = nullptr;
             }
+            // An asynchronous refresh may reorder or remove the shown command.
+            // Keep its displayed identity; never reinterpret an old position.
+            if (live == static_verbs_.end()) verb = nullptr;
+            else if (verb && child > 0 && std::none_of(live->children.begin(), live->children.end(),
+                [&](const StaticVerb& candidate) { return same(*verb, candidate); })) verb = nullptr;
             constexpr size_t kMaxTargets = 16;
             if (verb) {
                 for (size_t i = 0; i < paths_.size() && i < kMaxTargets; ++i) {
@@ -485,6 +496,7 @@ uint32_t ContextMenuController::FindLiveComId(const std::wstring& verb,
 void ContextMenuController::OpenMenu(std::vector<ui::FluentMenuItem> base_items) {
     base_items_ = std::move(base_items);
     menu_com_items_ = com_items_;
+    menu_static_verbs_ = static_verbs_;
     menu_open_ = true;
 }
 

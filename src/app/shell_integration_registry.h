@@ -13,6 +13,10 @@ enum class ShellIntegrationKind { Folders, WinE, ThisPc, Directory, Drive };
 bool ApplyShellIntegration(ShellIntegrationKind kind, const std::wstring& exe, bool on);
 bool ReadShellIntegration(ShellIntegrationKind kind, const std::wstring& exe);
 bool HasShellIntegrationOwnership(ShellIntegrationKind kind, const std::wstring& exe);
+// Exact pre-snapshot orphan signature, used by startup migration and explicit
+// repair. Ordinary enable/disable must not infer ownership of arbitrary values.
+bool HasLegacyShellIntegrationResidue();
+bool RepairLegacyShellIntegrationResidue();
 bool PrepareShellIntegrationUpgrade(ShellIntegrationKind kind, const std::wstring& exe);
 // Installer only: the selected group was owned immediately before the old
 // uninstaller ran. Missing values may have been removed by that old uninstaller.

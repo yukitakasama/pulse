@@ -260,6 +260,8 @@ private:
     HWND external_edit_ = nullptr; // borrowed; never moved, hidden or destroyed
     HWND edit_ = nullptr;
     HFONT edit_font_ = nullptr;
+    std::uint64_t edit_font_generation_ = 0;   // typography::Generation() of edit_font_
+    float edit_font_scale_ = 0.0f;
     HBRUSH edit_brush_ = nullptr;
     int present_offset_ = 0;
     int hover_row_ = -1;

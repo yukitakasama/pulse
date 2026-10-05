@@ -1,39 +1,36 @@
 #pragma once
 
-// Reads folders for the picker off the UI thread. Each Load runs on its own
-// short-lived thread and posts a PickerListing back; slow or dead network
-// paths therefore never block the dialog, and results that arrive after the
-// dialog closed are dropped.
-
 #include "folder_picker_model.h"
-
 #include <memory>
-#include <mutex>
 
 namespace pulse::ui {
 
+struct PickerValidation {
+    uint64_t generation = 0;
+    std::vector<std::wstring> paths;
+    std::wstring navigate;
+    DWORD error = ERROR_SUCCESS;
+    std::wstring failed_path;
+};
+
+// Two bounded workers share a latest-only queue; closing never waits on a network request.
 class PickerLoader {
 public:
-    PickerLoader(HWND hwnd, UINT message);
+    PickerLoader(HWND hwnd, UINT message, UINT validation_message = 0);
     ~PickerLoader();
     PickerLoader(const PickerLoader&) = delete;
     PickerLoader& operator=(const PickerLoader&) = delete;
-
-    // path "" lists the drives of This PC.
-    void Load(uint64_t generation, std::wstring path, PickerMode mode);
-    // Takes ownership of a posted listing (the message's LPARAM).
+    void Load(uint64_t generation, std::wstring path, PickerMode mode, PickerOptions options = {});
+    void Validate(uint64_t generation, std::wstring current, std::vector<std::wstring> names,
+                  PickerMode mode, PickerOptions options = {});
+    void CreateFolder(uint64_t generation, std::wstring current, std::wstring name);
     static std::unique_ptr<PickerListing> Take(LPARAM lparam);
-
+    static std::unique_ptr<PickerValidation> TakeValidation(LPARAM lparam);
 private:
-    struct Target {
-        std::mutex lock;
-        HWND hwnd = nullptr;
-        UINT message = 0;
-    };
+    struct Target;
     std::shared_ptr<Target> target_;
 };
 
-// The blocking read itself, shared by the loader and tests.
-PickerListing ReadPickerListing(const std::wstring& path, PickerMode mode);
+PickerListing ReadPickerListing(const std::wstring& path, PickerMode mode, const PickerOptions& options = {});
 
 } // namespace pulse::ui

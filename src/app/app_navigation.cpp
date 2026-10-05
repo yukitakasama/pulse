@@ -12,6 +12,7 @@
 #include "../ui/advanced_search_dialog.h"
 #include "../ui/quick_preview_window.h"
 #include "../ui/typography.h"
+#include "../ui/preview_format_catalog.h"
 #include "../ui/color_picker.h"
 #include "../common/localization.h"
 #include "../common/text_format.h"
@@ -21,6 +22,7 @@
 #include "entry_group.h"
 #include "entry_order_hold.h"
 #include "session.h"
+#include "layout_pane_selection.h"
 #include "../fs/fs_net_cache.h"
 #include "context_menu.h"
 #include "batch_rename.h"
@@ -231,40 +233,48 @@ static void PostLiveNetworkProgress(HWND hwnd, const std::shared_ptr<LiveNetwork
         delete holder;
 }
 
-void DropLiveNetworkSearch(AppState& s) {
-    if (s.liveNetworkSearch) s.liveNetworkSearch->cancel = true;
-    s.liveNetworkSearch.reset();
+void DropLiveNetworkSearch(AppState& s, uint64_t session_id) {
+    if (const auto live = s.liveNetworkSearches.Find(session_id))
+        s.pendingIndexSearches.erase(live->latest_id.load());
+    s.liveNetworkSearches.Drop(session_id);
 }
 
 static void StartLiveNetworkSearch(AppState& s, const index::Query& query, uint32_t id) {
     const std::wstring key = query.needle + L'\n' + query.path_prefix +
                              (query.folders_only ? L"\n1" : L"\n0");
-    if (auto live = s.liveNetworkSearch; live && live->key == key) {
+    if (auto live = s.liveNetworkSearches.Find(query.session_id); live && live->key == key) {
         // Same query (next page, new sort): answer from the walk so far; a
         // running walk keeps posting progress for the newest request.
         live->latest_id = id;
         PostLiveNetworkProgress(s.hwnd, live);
         return;
     }
-    DropLiveNetworkSearch(s);
+    DropLiveNetworkSearch(s, query.session_id);
     auto live = std::make_shared<LiveNetworkSearch>();
+    live->session_id = query.session_id;
     live->key = key;
     live->folder = query.path_prefix;
     live->latest_id = id;
-    s.liveNetworkSearch = live;
+    s.liveNetworkSearches.Set(live);
     std::thread([hwnd = s.hwnd, live, needle = query.needle, folders_only = query.folders_only] {
         index::LiveNetworkWalk(live->folder, needle, folders_only, live->matches, live->mutex,
             [&live] { return live->cancel.load(); },
             [&] { PostLiveNetworkProgress(hwnd, live); });
+        {
+            std::lock_guard<std::mutex> lock(live->mutex);
+            live->matches.complete = true;
+            if (live->cancel.load()) live->matches.error = ERROR_CANCELLED;
+        }
         if (!live->cancel.load()) PostLiveNetworkProgress(hwnd, live);
     }).detach();
 }
 
 void AcceptLiveNetworkProgress(AppState& s, const std::shared_ptr<LiveNetworkSearch>& live) {
-    if (!live || live != s.liveNetworkSearch) return;
+    if (!s.liveNetworkSearches.Owns(live)) return;
     const uint32_t id = live->latest_id.load();
     const auto found = s.pendingIndexSearches.find(id);
-    if (found == s.pendingIndexSearches.end() || found->second.network_ready) return;
+    if (found == s.pendingIndexSearches.end() || found->second.network_ready ||
+        found->second.query.session_id != live->session_id) return;
     const index::Query& asked = found->second.query;
     index::Query provider = asked;
     provider.offset = 0;
@@ -350,7 +360,10 @@ void DispatchIndexSearch(AppState& s, const index::Query& query, uint32_t id) {
     s.pendingIndexSearches.emplace(id, std::move(pending));
     s.index.SearchAsync(provider_query, id);
     if (live_network) StartLiveNetworkSearch(s, provider_query, id);
-    else s.networkIndex.SearchAsync(provider_query, id);
+    else {
+        DropLiveNetworkSearch(s, query.session_id);
+        s.networkIndex.SearchAsync(provider_query, id);
+    }
 }
 
 void RequestSearchPage(AppState& s, app::Tab& tab, const std::wstring& rest,
@@ -857,6 +870,11 @@ void LoadVirtualView(AppState& s, app::Tab& tab, const std::wstring& path, PathL
         LoadChangeView(s, tab, rest);
         return;
     }
+    if (kind == L"networks") {
+        RequestNetworkLocations(s);
+        FillNetworkLocationsView(s, tab);
+        return;
+    }
     if (kind == L"workspace") {
         OpenWorkspace(s, _wtoi(rest.c_str()));
         return;
@@ -979,6 +997,7 @@ static std::shared_ptr<const app::FolderSizeLookup> SortFolderSizes(
 void StartLoadingPath(AppState& s, app::Tab& tab, const std::wstring& path, PathLoadReason reason) {
     tab.explorer_handoff.reset();
     SyncTagGroups(s);
+    DropLiveNetworkSearch(s, tab.search_session_id);
     s.index.CancelSession(tab.search_session_id);
     std::erase_if(s.pendingIndexSearches,[&](const auto& item){return item.second.query.session_id==tab.search_session_id;});
     tab.filename_live_generation=0;
@@ -993,6 +1012,7 @@ void StartLoadingPath(AppState& s, app::Tab& tab, const std::wstring& path, Path
     tab.loading = true;
     tab.ClearSelection();
     tab.pending_selected_name.clear();
+    tab.pending_preview_rename.clear();
     tab.pending_selected_names.clear();
     tab.pending_ensure_selection_visible = false;
     tab.pending_generation = 0;
@@ -1159,8 +1179,10 @@ void ApplyWorkerResult(AppState& s, app::WorkResult& res) {
             tab->pending_selected_name.clear();
             tab->pending_ensure_selection_visible = false;
             std::wstring renameTarget;
+            const auto previewRenameTarget = std::exchange(tab->pending_preview_rename, {});
+            const bool previewRename = focusedTab && !previewRenameTarget.empty();
             if (focusedTab) {
-                renameTarget = s.pendingRenameName;
+                renameTarget = previewRename ? previewRenameTarget : s.pendingRenameName;
                 if (renameTarget.empty() && s.renameIndex >= 0 && tab->snapshot &&
                     s.renameIndex < static_cast<int>(tab->EntryCount())) {
                     renameTarget = tab->EntryAt(s.renameIndex).name;
@@ -1228,7 +1250,7 @@ void ApplyWorkerResult(AppState& s, app::WorkResult& res) {
                     break;
                 }
                 if (!startedRename) {
-                    s.pendingRenameName = renameTarget;
+                    if (!previewRename) s.pendingRenameName = renameTarget;
                     if (s.renameIndex >= 0) HideRenameOverlay(s, false);
                 }
             }
@@ -1381,7 +1403,7 @@ void RefreshActiveTab(AppState& s, RefreshReason reason) {
     if (!tab) return;
     // F5 or a finished file operation must see the share as it is now (#74).
     if (reason == RefreshReason::Explicit || reason == RefreshReason::OperationCompleted)
-        DropLiveNetworkSearch(s);
+        DropLiveNetworkSearch(s, tab->search_session_id);
     RefreshPath(s, tab->current_path, reason);
 }
 
@@ -1635,6 +1657,7 @@ void RestoreNavigationReturnSelection(AppState& s, app::Tab& tab,
 }
 
 void NavigateTo(AppState& s, const std::wstring& path) {
+    if (OpenSystemNetworkShortcut(s, path)) return;
     app::Tab* tab = ActiveTab(s);
     if (!tab) return;
     std::wstring normalized = fs::NormalizePath(path);
@@ -1704,9 +1727,9 @@ void ApplyLayoutPreset(AppState& s, app::LayoutPreset preset) {
         Panes(s).push_back(std::move(p));
         if (tab) StartLoadingPath(s, *tab, clone);
     }
-    std::vector<app::Pane*> used;
-    used.reserve(n);
-    for (size_t i = 0; i < n; ++i) used.push_back(Panes(s)[i].get());
+    std::vector<app::Pane*> visible;
+    if (Root(s)) Root(s)->CollectPanes(visible);
+    const auto used = app::SelectLayoutPanes(Panes(s), s.pane, n, visible);
     Root(s) = app::MakePresetTree(preset, used);
     LayoutOf(s) = preset;
     if (n != 2) {
@@ -1726,6 +1749,7 @@ void ApplyLayoutPreset(AppState& s, app::LayoutPreset preset) {
             for (auto& p : Panes(s)) p->target = false;
         }
     }
+    RememberLayoutFocus(s);
     SyncVisibleWatches(s);
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
@@ -2112,16 +2136,16 @@ void OpenTabAt(AppState& s, const std::wstring& path) {
         NewTab(s, path);
         return;
     }
-    // This PC. The tab model turns an empty path into C:\ for callers that
-    // pass none, so create the tab first and point it at This PC afterwards.
+    // Preserve the explicit virtual location before binding/loading the tab.
     RememberLayoutFocus(s);
-    s.window_tabs.NewTab(L"C:\\");
+    s.window_tabs.NewTabAtLocation(s.window_tabs.items.size(), path);
     BindCurrentLayout(s);
     if (app::Tab* tab = ActiveTab(s)) StartLoadingPath(s, *tab, std::wstring());
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
 void NewTab(AppState& s, const std::wstring& path) {
+    if (OpenSystemNetworkShortcut(s, path)) return;
     RememberLayoutFocus(s);
     s.window_tabs.NewTab(path.empty() ? L"C:\\" : path);
     BindCurrentLayout(s);
@@ -2141,12 +2165,12 @@ int FindFolderTab(AppState& s, const std::wstring& path, app::Pane** pane_out) {
     const std::wstring normalized = fs::NormalizePath(path);
     for (size_t i = 0; i < s.window_tabs.items.size(); ++i) {
         app::LayoutTab& layout = *s.window_tabs.items[i];
-        for (auto& pane : layout.panes) {
+        for (auto* pane : layout.VisiblePanes()) {
             const app::Tab* tab = pane ? pane->ActiveTab() : nullptr;
             if (!tab || tab->current_path.empty()) continue;
             const std::wstring tab_path = fs::NormalizePath(tab->current_path);
             if (_wcsicmp(tab_path.c_str(), normalized.c_str()) != 0) continue;
-            if (pane_out) *pane_out = pane.get();
+            if (pane_out) *pane_out = pane;
             return static_cast<int>(i);
         }
     }
@@ -2218,6 +2242,7 @@ void SelectNameInTab(AppState& s, app::Tab& tab, const std::wstring& name) {
 }
 
 void NewBackgroundTab(AppState& s, const std::wstring& path) {
+    if (OpenSystemNetworkShortcut(s, path)) return;
     const app::LayoutTab* opener = s.window_tabs.Active();
     if (path.empty() || !opener) {
         NewTab(s, path);
@@ -2254,6 +2279,7 @@ void OpenSettingsTab(AppState& s, int page) {
     const std::wstring path = app::MakeSettingsPath(
         app::SettingsController::PageName(s.settings.page()));
     if (page == 1) s.index.RefreshVolumesAsync();
+    if (page == 5) ui::DetectPreviewCodecs(true, s.hwnd);
     for (size_t i = 0; i < s.window_tabs.items.size(); ++i) {
         app::LayoutTab& layout = *s.window_tabs.items[i];
         bool found = false;
@@ -2269,6 +2295,7 @@ void OpenSettingsTab(AppState& s, int page) {
         }
         s.settings.SelectPage(page);
         if (page == 1) s.index.RefreshVolumesAsync();
+    if (page == 5) ui::DetectPreviewCodecs(true, s.hwnd);
         InvalidateRect(s.hwnd, nullptr, FALSE);
         return;
     }
@@ -2285,6 +2312,10 @@ void CloseLayoutTab(AppState& s, size_t idx) {
         return;
     }
     RememberLayoutFocus(s);
+    if (s.window_tabs.items.size() > 1 && !s.window_tabs.items[idx]->pinned) {
+        for (const auto& pane : s.window_tabs.items[idx]->panes)
+            DropLiveNetworkSearch(s, pane->view.search_session_id);
+    }
     s.window_tabs.CloseTab(idx);
     BindCurrentLayout(s);
     RevalidateVisibleFolders(s);

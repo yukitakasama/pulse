@@ -63,28 +63,31 @@ bool IsType(const uint8_t* p, const char* type) { return std::memcmp(p, type, 4)
 bool ParseApng(const std::vector<uint8_t>& file, ApngInfo& info) {
     info = ApngInfo{};
     if (file.size() < 8 + 25 || std::memcmp(file.data(), kPngSignature, 8) != 0) return false;
-    bool have_actl = false, seen_idat = false, have_ihdr = false;
+    bool have_actl = false, seen_idat = false, have_ihdr = false, ended = false;
+    const auto malformed = [&info]() { info.incomplete_reason = L"malformed"; return false; };
     ApngFrame* current = nullptr;
     bool current_uses_idat = false;
     size_t pos = 8;
     while (pos + 12 <= file.size()) {
         const uint32_t length = Be32(&file[pos]);
         const uint8_t* type = &file[pos + 4];
-        if (length > file.size() - pos - 12) break;
+        if (length > file.size() - pos - 12) { info.incomplete_reason = L"truncated-data"; break; }
         const size_t data = pos + 8;
         if (IsType(type, "IHDR")) {
-            if (length < 13) return false;
+            if (length != 13 || have_ihdr) return malformed();
             info.width = Be32(&file[data]);
             info.height = Be32(&file[data + 4]);
             info.ihdr = data;
             have_ihdr = true;
         } else if (IsType(type, "acTL")) {
-            if (length < 8 || seen_idat) return false;
+            if (length != 8 || seen_idat || have_actl) return malformed();
             have_actl = true;
+            info.declared_frames = Be32(&file[data]);
+            if (!info.declared_frames) return malformed();
             info.plays = Be32(&file[data + 4]);
         } else if (IsType(type, "fcTL")) {
-            if (length < 26 || !have_actl) return false;
-            if (info.frames.size() >= kMaxFrames) break;
+            if (length != 26 || !have_actl || !have_ihdr) return malformed();
+            ++info.observed_frames;
             ApngFrame frame;
             frame.width = Be32(&file[data + 4]);
             frame.height = Be32(&file[data + 8]);
@@ -100,7 +103,13 @@ bool ParseApng(const std::vector<uint8_t>& file, ApngInfo& info) {
             frame.blend = file[data + 25] <= 1 ? file[data + 25] : 0;
             if (!frame.width || !frame.height || frame.x > info.width || frame.y > info.height ||
                 frame.width > info.width - frame.x || frame.height > info.height - frame.y)
-                return false;
+                return malformed();
+            if (info.frames.size() >= kMaxFrames) {
+                info.incomplete_reason = L"frame-limit";
+                current = nullptr;
+                pos = data + length + 4;
+                continue;
+            }
             info.frames.push_back(std::move(frame));
             current = &info.frames.back();
             current_uses_idat = !seen_idat;
@@ -110,6 +119,7 @@ bool ParseApng(const std::vector<uint8_t>& file, ApngInfo& info) {
         } else if (IsType(type, "fdAT")) {
             if (current && !current_uses_idat && length > 4) current->data.emplace_back(data + 4, length - 4);
         } else if (IsType(type, "IEND")) {
+            ended = true;
             break;
         } else if (!seen_idat && !IsType(type, "tEXt") && !IsType(type, "zTXt") &&
                    !IsType(type, "iTXt") && !IsType(type, "eXIf")) {
@@ -119,14 +129,27 @@ bool ParseApng(const std::vector<uint8_t>& file, ApngInfo& info) {
         pos = data + length + 4;
     }
     if (!have_ihdr || !have_actl || !info.width || !info.height) return false;
-    info.frames.erase(std::remove_if(info.frames.begin(), info.frames.end(),
-                                     [](const ApngFrame& f) { return f.data.empty(); }),
-                      info.frames.end());
+    if (!ended && info.incomplete_reason.empty()) info.incomplete_reason = L"truncated-data";
+    if (info.observed_frames != info.declared_frames && info.incomplete_reason.empty())
+        info.incomplete_reason = L"frame-count-mismatch";
+    const auto empty = std::find_if(info.frames.begin(), info.frames.end(), [](const ApngFrame& f) { return f.data.empty(); });
+    if (empty != info.frames.end()) {
+        info.frames.erase(empty, info.frames.end());
+        if (info.incomplete_reason.empty()) info.incomplete_reason = L"truncated-data";
+    }
     if (!info.frames.empty()) {
         // The first frame has no previous picture to restore.
         if (info.frames[0].dispose == 2) info.frames[0].dispose = 1;
     }
     return info.frames.size() >= 2;
+}
+
+std::wstring MakeImageFramesPayload(std::wstring_view type, uint32_t loaded, uint32_t declared,
+                                   uint32_t selected, std::wstring_view reason) {
+    std::wstring result = L"PULSEIMAGE\t1\nT\t" + std::wstring(type) + L"\nF\t" + std::to_wstring(loaded) +
+        L"\t" + std::to_wstring(declared) + L"\t" + std::to_wstring(selected) + L"\n";
+    if (!reason.empty()) result += L"W\t" + std::wstring(reason) + L"\n";
+    return result;
 }
 
 std::vector<uint8_t> BuildApngFramePng(const std::vector<uint8_t>& file, const ApngInfo& info, size_t index) {

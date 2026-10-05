@@ -39,6 +39,8 @@ HRESULT CreateRenderingParams(IDWriteFactory2* factory, HMONITOR monitor,
 enum class TextRenderMode : int { Auto = 0, Sharp = 1, Smooth = 2 };
 void SetTextRenderMode(TextRenderMode mode) noexcept;
 TextRenderMode CurrentTextRenderMode() noexcept;
+// Sent to existing UI-thread windows after the selected backend changes.
+UINT TextBackendChangedMessage() noexcept;
 // Auto draws with LumaText; Sharp and Smooth use DirectWrite directly.
 inline bool UseLumaTextForUi() noexcept { return CurrentTextRenderMode() == TextRenderMode::Auto; }
 
@@ -48,6 +50,14 @@ inline bool UseLumaTextForUi() noexcept { return CurrentTextRenderMode() == Text
 void SetUiFontScale(int percent) noexcept;
 int UiFontScalePercent() noexcept;
 float UiFontScale() noexcept;
+
+// Native EDIT controls hosted on Pulse surfaces (address bar and rename,
+// dialog fields, menu filters, Quick Look find) all use this font: the UI text
+// family at `dip` DIPs times the interface font size and the DPI scale, so the
+// editor matches the DirectWrite text around it. The caller owns the HFONT and
+// recreates it when Generation() changes.
+int EditFontPixels(float scale, float dip = 14.0f) noexcept;
+HFONT CreateEditFont(float scale, float dip = 14.0f);
 
 // Invalidate language-dependent fallback and measurement caches.
 void InvalidateCaches();

@@ -46,23 +46,100 @@ bool IsPickerImageName(std::wstring_view name) {
     return false;
 }
 
-bool PickerShowsEntry(DWORD attributes, std::wstring_view name, PickerMode mode) {
-    if (name.empty() || name == L"." || name == L"..") return false;
-    if (attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) return false;
-    if (attributes & FILE_ATTRIBUTE_DIRECTORY) return true;
-    return mode == PickerMode::Image && IsPickerImageName(name);
+bool PickerMatchesFilter(std::wstring_view name, PickerMode mode, const PickerOptions& options) {
+    if (mode == PickerMode::Folder) return false;
+    if (mode == PickerMode::Image && !IsPickerImageName(name)) return false;
+    if (options.filters.empty()) return true;
+    const auto& patterns = options.filters[std::min(options.filter_index, options.filters.size() - 1)].pattern;
+    auto match = [](std::wstring_view text, std::wstring_view pattern) {
+        if (pattern == L"*.*") return true;
+        size_t t = 0, p = 0, star = std::wstring_view::npos, retry = 0;
+        while (t < text.size()) {
+            if (p < pattern.size() && (pattern[p] == L'?' || std::towlower(pattern[p]) == std::towlower(text[t]))) { ++p; ++t; }
+            else if (p < pattern.size() && pattern[p] == L'*') { star = p++; retry = t; }
+            else if (star != std::wstring_view::npos) { p = star + 1; t = ++retry; }
+            else return false;
+        }
+        while (p < pattern.size() && pattern[p] == L'*') ++p;
+        return p == pattern.size();
+    };
+    size_t start = 0;
+    while (start <= patterns.size()) {
+        const size_t end = patterns.find(L';', start);
+        auto pattern = std::wstring_view(patterns).substr(start, end == std::wstring::npos ? end : end - start);
+        while (!pattern.empty() && std::iswspace(pattern.front())) pattern.remove_prefix(1);
+        while (!pattern.empty() && std::iswspace(pattern.back())) pattern.remove_suffix(1);
+        if (!pattern.empty() && match(name, pattern)) return true;
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+    return false;
 }
 
-void SortPickerEntries(std::vector<PickerEntry>& entries) {
-    std::stable_sort(entries.begin(), entries.end(),
-                     [](const PickerEntry& a, const PickerEntry& b) {
-        const bool a_folder = a.kind != PickerEntryKind::Image;
-        const bool b_folder = b.kind != PickerEntryKind::Image;
+DWORD FollowPickerShortcutChain(std::wstring& path,
+    const std::function<DWORD(std::wstring&, bool&)>& read_next,
+    const std::function<bool()>& cancelled) {
+    std::vector<std::wstring> visited;
+    for (;;) {
+        if (cancelled && cancelled()) return ERROR_CANCELLED;
+        for (const auto& previous : visited)
+            if (SamePickerPath(previous, path)) return ERROR_CANT_RESOLVE_FILENAME;
+        visited.push_back(path);
+        bool followed = false;
+        const DWORD error = read_next(path, followed);
+        if (error != ERROR_SUCCESS) return error;
+        if (!followed) return ERROR_SUCCESS;
+        if (visited.size() > 16) return ERROR_CANT_RESOLVE_FILENAME;
+    }
+}
+
+bool ParsePickerNames(std::wstring_view text, std::vector<std::wstring>& names) {
+    names.clear();
+    while (!text.empty() && std::iswspace(text.front())) text.remove_prefix(1);
+    while (!text.empty() && std::iswspace(text.back())) text.remove_suffix(1);
+    if (text.empty()) return true;
+    if (text.find(L'"') == std::wstring_view::npos) { names.emplace_back(text); return true; }
+    while (!text.empty()) {
+        if (text.front() != L'"') { names.clear(); return false; }
+        text.remove_prefix(1);
+        const size_t end = text.find(L'"');
+        if (end == std::wstring_view::npos || end == 0) { names.clear(); return false; }
+        names.emplace_back(text.substr(0, end));
+        text.remove_prefix(end + 1);
+        if (!text.empty() && !std::iswspace(text.front())) { names.clear(); return false; }
+        while (!text.empty() && std::iswspace(text.front())) text.remove_prefix(1);
+    }
+    return true;
+}
+
+bool PickerShowsEntry(DWORD attributes, std::wstring_view name, PickerMode mode, const PickerOptions& options) {
+    if (name.empty() || name == L"." || name == L"..") return false;
+    if (!options.show_hidden && (attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) return false;
+    if (!options.search.empty()) {
+        std::wstring folded(name), needle(options.search);
+        for (auto& c : folded) c = static_cast<wchar_t>(std::towlower(c));
+        for (auto& c : needle) c = static_cast<wchar_t>(std::towlower(c));
+        if (folded.find(needle) == std::wstring::npos) return false;
+    }
+    const bool shortcut = name.size() >= 4 && CompareStringOrdinal(name.data() + name.size() - 4, 4, L".lnk", 4, TRUE) == CSTR_EQUAL;
+    return (attributes & FILE_ATTRIBUTE_DIRECTORY) || shortcut || PickerMatchesFilter(name, mode, options);
+}
+
+void SortPickerEntries(std::vector<PickerEntry>& entries, const PickerOptions& options) {
+    std::stable_sort(entries.begin(), entries.end(), [&](const PickerEntry& a, const PickerEntry& b) {
+        const bool a_folder = a.kind == PickerEntryKind::Folder || a.kind == PickerEntryKind::Drive;
+        const bool b_folder = b.kind == PickerEntryKind::Folder || b.kind == PickerEntryKind::Drive;
         if (a_folder != b_folder) return a_folder;
-        // Drives keep their letter order.
-        if (a.kind == PickerEntryKind::Drive && b.kind == PickerEntryKind::Drive)
-            return CompareNames(a.path, b.path) < 0;
-        return CompareNames(a.name, b.name) < 0;
+        int order = 0;
+        if (options.sort == PickerSort::Modified) order = CompareFileTime(&a.modified, &b.modified);
+        else if (options.sort == PickerSort::Size) order = a.size < b.size ? -1 : a.size > b.size ? 1 : 0;
+        else if (options.sort == PickerSort::Type) {
+            auto extension = [](const std::wstring& name) { const auto dot = name.rfind(L'.'); return dot == std::wstring::npos ? std::wstring() : name.substr(dot); };
+            order = CompareNames(extension(a.name), extension(b.name));
+        }
+        if (!order) order = CompareNames(a.kind == PickerEntryKind::Drive ? a.path : a.name,
+                                        b.kind == PickerEntryKind::Drive ? b.path : b.name);
+        return options.descending ? order > 0 : order < 0;
     });
 }
 
@@ -123,11 +200,14 @@ bool SamePickerPath(std::wstring_view a, std::wstring_view b) {
 
 std::wstring PickerChosenPath(PickerMode mode, std::wstring_view current,
                               const PickerEntry* selected) {
-    if (mode == PickerMode::Image) {
-        return selected && selected->kind == PickerEntryKind::Image ? selected->path
+    const bool shortcut = selected && selected->name.size() >= 4 &&
+        CompareStringOrdinal(selected->name.data() + selected->name.size() - 4, 4, L".lnk", 4, TRUE) == CSTR_EQUAL;
+    if (shortcut) return selected->path;
+    if (mode != PickerMode::Folder) {
+        return selected && (selected->kind == PickerEntryKind::Image || (mode == PickerMode::File && selected->kind == PickerEntryKind::File)) ? selected->path
                                                                      : std::wstring();
     }
-    if (selected && selected->kind != PickerEntryKind::Image) return selected->path;
+    if (selected && (selected->kind == PickerEntryKind::Folder || selected->kind == PickerEntryKind::Drive)) return selected->path;
     return std::wstring(current);
 }
 
@@ -144,6 +224,7 @@ int PickerTypeAhead(const std::vector<PickerEntry>& entries, int from, wchar_t c
 }
 
 void PickerHistory::Navigate(std::wstring from) {
+    forward_.clear();
     if (!back_.empty() && SamePickerPath(back_.back(), from)) return;
     back_.push_back(std::move(from));
     constexpr size_t kMaxDepth = 64;
@@ -155,6 +236,20 @@ std::wstring PickerHistory::Back() {
     std::wstring previous = std::move(back_.back());
     back_.pop_back();
     return previous;
+}
+
+std::wstring PickerHistory::Back(std::wstring current) {
+    if (back_.empty()) return current;
+    forward_.push_back(std::move(current));
+    return Back();
+}
+
+std::wstring PickerHistory::Forward(std::wstring current) {
+    if (forward_.empty()) return current;
+    back_.push_back(std::move(current));
+    auto next = std::move(forward_.back());
+    forward_.pop_back();
+    return next;
 }
 
 } // namespace pulse::ui

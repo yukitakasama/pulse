@@ -24,6 +24,7 @@ struct Result {
 
 class Host {
 public:
+    DWORD ProcessId() const { return process_.dwProcessId; }
     bool Start() {
         wchar_t exe[MAX_PATH]{};
         GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
@@ -63,9 +64,10 @@ public:
     bool Request(const std::wstring& path, Result& result, DWORD attrs_override = MAXDWORD,
                  uint32_t pixel_size = pulse::ipc::kPreviewDefaultPixelSize,
                  pulse::ipc::PreviewRequestKind kind = pulse::ipc::PreviewRequestKind::Content,
-                 uint32_t flags = 0) {
+                 uint32_t flags = 0, uint32_t frame_index = 0) {
         pulse::ipc::PreviewRequest request{};
         request.flags = flags;
+        request.frame_index = frame_index;
         request.request_id = next_++;
         request.generation = request.request_id;
         request.kind = kind;

@@ -6,6 +6,9 @@
 #include "../common/current_user_security.h"
 #include "../common/crash_reporter.h"
 #include "preview_decoders.h"
+#include "folder_thumbnail.h"
+#include "preview_integrity.h"
+#include "../common/runtime_log.h"
 #include "preview_file_utils.h"
 #include "preview_properties.h"
 #include <windows.h>
@@ -14,12 +17,14 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 using namespace pulse;
 using preview::ExtensionOf;
 using preview::IsOfflinePlaceholder;
 using preview::PreviewPropertyValue;
 using preview::ReadProperties;
+using preview::ReadMediaDurationMs;
 
 namespace {
 
@@ -67,6 +72,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             response.property_count = static_cast<uint32_t>(properties.size());
             response.status = 0;
             made = true;
+        } else if ((req.flags & ipc::kPreviewRequestFlagFolderThumbnail) != 0) {
+            SetLastError(ERROR_SUCCESS);
+            if ((req.attrs & FILE_ATTRIBUTE_DIRECTORY) && !IsOfflinePlaceholder(req.attrs))
+                made = preview::DecodeFolderThumbnail(path, std::clamp(req.pixel_size, 32u, 512u),
+                    pixels, w, h, stride,
+                    (req.flags & ipc::kPreviewRequestFlagFolderSingle) != 0,
+                    (req.flags & ipc::kPreviewRequestFlagFolderRefresh) != 0);
+            response.kind = made ? ipc::PreviewContentKind::Bitmap : ipc::PreviewContentKind::Unsupported;
+            response.status = made ? 0 : GetLastError() == ERROR_TIMEOUT ? ERROR_TIMEOUT : 1;
         } else {
             const std::wstring extension = ExtensionOf(path);
             const UINT cap = ipc::ClampPreviewPixelSize(req.pixel_size, false);
@@ -75,7 +89,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
                 cap, (req.flags & ipc::kPreviewRequestFlagGrid) != 0 ||
                      cap <= preview::kGridThumbnailEdge};
             preview::DecodeResult result;
+            const ULONGLONG decode_started = GetTickCount64();
             made = preview::DecodeContent(decode, result);
+            if (result.error == L"pdf-thumbnail-budget")
+                diagnostics::runtime::Event("pdf_thumbnail_budget", {
+                    {"elapsed_ms", GetTickCount64() - decode_started},
+                    {"request", req.request_id}, {"pixels", cap}});
+            response.integrity = preview::DescribeIntegrity(result, made);
+            if (!decode.grid) diagnostics::runtime::Event("preview_integrity", {
+                {"state", static_cast<uint32_t>(response.integrity.state)},
+                {"reason", static_cast<uint32_t>(response.integrity.reason)},
+                {"unit", static_cast<uint32_t>(response.integrity.unit)},
+                {"loaded", response.integrity.loaded}, {"total", response.integrity.total},
+                {"kind", static_cast<uint32_t>(result.kind)}, {"index", req.frame_index}});
             pixels = std::move(result.pixels);
             w = result.width; h = result.height; stride = result.stride;
             source_w = result.source_width; source_h = result.source_height;
@@ -83,6 +109,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             errorText = std::move(result.error);
             response.kind = result.kind;
             response.frame_count = result.frame_count;
+            const uint32_t decoded_duration_ms = result.duration_ms;
             response.frame_delay_ms = result.frame_delay_ms;
             response.loop_count = result.loop_count;
             response.flags |= (static_cast<uint32_t>(result.text_encoding) <<
@@ -100,6 +127,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             response.error_chars = static_cast<uint32_t>(errorText.size());
             response.bytes_read = bytesRead;
             if (truncated) response.flags |= ipc::kPreviewFlagTruncated;
+            // Grid thumbnails mark videos with their playing time.
+            if (made && response.kind == ipc::PreviewContentKind::Bitmap &&
+                (req.flags & ipc::kPreviewRequestFlagGrid) != 0 && !IsOfflinePlaceholder(req.attrs))
+                response.duration_ms = decoded_duration_ms ? decoded_duration_ms : ReadMediaDurationMs(path);
         }
         response.width=w; response.height=h; response.stride=stride;
         response.source_width = source_w;
@@ -111,7 +142,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             mapping=CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,
                 static_cast<DWORD>(pixels.size()),mappingName.c_str());
             if (mapping) view=MapViewOfFile(mapping,FILE_MAP_WRITE,0,0,pixels.size());
-            if (!view) { response.status=2; mappingName.clear(); }
+            if (!view) { response.status=2; mappingName.clear();
+                response.integrity.state = preview::IntegrityState::Failed;
+                response.integrity.reason = preview::IntegrityReason::Unavailable;
+            }
             else memcpy(view,pixels.data(),pixels.size());
         }
         response.mapping_chars=static_cast<uint32_t>(mappingName.size());

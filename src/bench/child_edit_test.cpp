@@ -1,5 +1,7 @@
 #include "../ui/edit_host.h"
 #include "../ui/ui_compositor.h"
+#include "../ui/typography.h"
+#include "../ui/lumatext_renderer.h"
 #include <cstdio>
 #include <string>
 #include <commctrl.h>
@@ -57,7 +59,74 @@ bool HasRenderedText(pulse::ui::Compositor& compositor, HWND edit) {
     SelectObject(dc, old);
     DeleteObject(bitmap);
     DeleteDC(dc);
+    if (!painted || ink <= 20) {
+        const auto* stats = compositor.GetLumaTextStats();
+        std::printf("[DIAG] edit painted=%d ink=%d size=%ldx%ld format=%d builds=%llu hits=%llu\n",
+            painted ? 1 : 0, ink, rect.right, rect.bottom, compositor.TextFormat() ? 1 : 0,
+            static_cast<unsigned long long>(stats ? stats->edit_layout_builds : 0),
+            static_cast<unsigned long long>(stats ? stats->edit_layout_cache_hits : 0));
+    }
     return painted && ink > 20;
+}
+
+void CheckEditLayoutCache(HWND parent, pulse::ui::Compositor& compositor) {
+    // Init creates graphics resources; production callers initialize formats
+    // separately before presenting editors, as the other fixtures do below.
+    compositor.RecreateTextFormats(1.0f);
+    Check(compositor.TextFormat() != nullptr, "initialize cache fixture text format");
+    HWND edit = pulse::ui::CreateChildEdit(parent, L"cache 中文");
+    Check(edit != nullptr, "create isolated edit layout cache fixture");
+    if (!edit) return;
+    SetWindowPos(edit, nullptr, 20, 30, 320, 30, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    ShowWindow(parent, SW_SHOWNOACTIVATE);
+    Check(HasRenderedText(compositor, edit), "warm actual DirectWrite editor layout");
+    auto builds = compositor.GetLumaTextStats()->edit_layout_builds;
+    const auto hits = compositor.GetLumaTextStats()->edit_layout_cache_hits;
+    Check(HasRenderedText(compositor, edit) && HasRenderedText(compositor, edit) &&
+        compositor.GetLumaTextStats()->edit_layout_builds == builds &&
+        compositor.GetLumaTextStats()->edit_layout_cache_hits >= hits + 2,
+        "unchanged editor repaints reuse layout without reshaping");
+    SetWindowTextW(edit, L"changed 中文");
+    Check(HasRenderedText(compositor, edit) && compositor.GetLumaTextStats()->edit_layout_builds > builds,
+        "text change rebuilds editor layout");
+    builds = compositor.GetLumaTextStats()->edit_layout_builds;
+    SetWindowPos(edit, nullptr, 20, 30, 320, 45, SWP_NOZORDER | SWP_NOACTIVATE);
+    Check(HasRenderedText(compositor, edit) && compositor.GetLumaTextStats()->edit_layout_builds > builds,
+        "height change rebuilds editor layout");
+    builds = compositor.GetLumaTextStats()->edit_layout_builds;
+    pulse::ui::typography::InvalidateCaches();
+    Check(HasRenderedText(compositor, edit) && compositor.GetLumaTextStats()->edit_layout_builds > builds,
+        "font generation change rebuilds editor layout with the same format pointer");
+    builds = compositor.GetLumaTextStats()->edit_layout_builds;
+    compositor.RecreateTextFormats(1.5f);
+    Check(HasRenderedText(compositor, edit) && compositor.GetLumaTextStats()->edit_layout_builds > builds,
+        "new format and font size rebuild editor layout");
+    builds = compositor.GetLumaTextStats()->edit_layout_builds;
+    compositor.TextFormat()->SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT);
+    Check(HasRenderedText(compositor, edit) && compositor.GetLumaTextStats()->edit_layout_builds > builds,
+        "in-place reading direction change rebuilds editor layout");
+    builds = compositor.GetLumaTextStats()->edit_layout_builds;
+    compositor.TextFormat()->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, 28.0f, 22.0f);
+    Check(HasRenderedText(compositor, edit) && compositor.GetLumaTextStats()->edit_layout_builds > builds,
+        "in-place line spacing change rebuilds editor layout");
+    compositor.RecreateTextFormats(1.0f);
+    for (int i = 0; i < 5; ++i) {
+        const std::wstring text = L"bounded layout " + std::to_wstring(i);
+        SetWindowTextW(edit, text.c_str());
+        Check(HasRenderedText(compositor, edit), "populate bounded editor layout slots");
+    }
+    builds = compositor.GetLumaTextStats()->edit_layout_builds;
+    SetWindowTextW(edit, L"bounded layout 0");
+    Check(HasRenderedText(compositor, edit) && compositor.GetLumaTextStats()->edit_layout_builds > builds,
+        "fifth distinct layout evicts the oldest of four retained slots");
+    const std::wstring long_text(4097, L'a');
+    SetWindowTextW(edit, long_text.c_str());
+    builds = compositor.GetLumaTextStats()->edit_layout_builds;
+    Check(HasRenderedText(compositor, edit) && HasRenderedText(compositor, edit) &&
+        compositor.GetLumaTextStats()->edit_layout_builds == builds + 2,
+        "oversized editor text is rendered without cache retention");
+    DestroyWindow(edit);
+    ShowWindow(parent, SW_HIDE);
 }
 }
 int wmain() {
@@ -76,6 +145,7 @@ int wmain() {
         pulse::ui::Compositor compositor;
         Check(parent && compositor.Init(parent), "create composition host for native child editors");
         Check(compositor.LumaTextEnabled(), "LumaText remains enabled");
+        CheckEditLayoutCache(parent, compositor);
         for (const auto [redirected, scale] : {std::pair{false, 1.0f}, std::pair{false, 1.5f},
                 std::pair{true, 1.0f}, std::pair{true, 1.5f}}) {
             compositor.RecreateTextFormats(scale);
@@ -108,6 +178,72 @@ int wmain() {
             SendMessageW(edit, WM_UNDO, 0, 0);
             GetWindowTextW(edit, text, ARRAYSIZE(text));
             Check(std::wstring(text) == L"show 中文", "native undo remains functional");
+            for (const auto mode : {pulse::ui::typography::TextRenderMode::Auto,
+                    pulse::ui::typography::TextRenderMode::Sharp,
+                    pulse::ui::typography::TextRenderMode::Smooth,
+                    pulse::ui::typography::TextRenderMode::Auto}) {
+                pulse::ui::typography::SetTextRenderMode(mode);
+                const bool luma_ui = mode == pulse::ui::typography::TextRenderMode::Auto;
+                Check(compositor.LumaTextAvailable() && compositor.LumaTextEnabled() == luma_ui &&
+                    compositor.CustomEditEnabled(), "inputs retain DirectWrite presentation across all UI modes");
+                DWORD flags = 0;
+                const bool opaque = GetLayeredWindowAttributes(edit, nullptr, nullptr, &flags) && (flags & LWA_ALPHA);
+                Check(opaque == redirected, "existing editor preserves its original presentation surface");
+                const auto before_draws = compositor.GetLumaTextStats()->edit_directwrite_draws;
+                Check(HasRenderedText(compositor, edit) &&
+                    compositor.GetLumaTextStats()->edit_directwrite_draws > before_draws,
+                    "every text mode draws actual DirectWrite input glyph pixels");
+                Check(compositor.GetLumaTextStats()->edit_rendering_mode ==
+                    (mode == pulse::ui::typography::TextRenderMode::Sharp ? DWRITE_RENDERING_MODE_GDI_CLASSIC
+                                                                       : DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC),
+                    "input uses the list's rendering parameters for the selected mode");
+                IDWriteTextLayout* layout = nullptr;
+                compositor.DwriteFactory()->CreateTextLayout(L"show 中文", 7, compositor.TextFormat(),
+                    1.0e6f, 30 * scale, &layout);
+                Check(layout != nullptr, "create independent DirectWrite selection reference");
+                if (layout) {
+                    float x = 0, y = 0;
+                    DWRITE_HIT_TEST_METRICS hit{};
+                    layout->HitTestTextPosition(3, FALSE, &x, &y, &hit);
+                    const int hit_x = static_cast<int>(x + hit.width * 0.25f + 2.0f);
+                    SendMessageW(edit, EM_SETSEL, 0, 0);
+                    const auto before_hits = compositor.GetLumaTextStats()->edit_directwrite_hits;
+                    SetCapture(edit);
+                    SendMessageW(edit, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(hit_x, 4));
+                    SendMessageW(edit, WM_LBUTTONUP, 0, MAKELPARAM(hit_x, 4));
+                    DWORD lo = 0, hi = 0;
+                    SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&lo), reinterpret_cast<LPARAM>(&hi));
+                    Check(lo == 0 && hi == 3 && compositor.GetLumaTextStats()->edit_directwrite_hits > before_hits,
+                        "real editor drag selection matches DirectWrite cluster hit positions");
+                    layout->Release();
+                }
+                SendMessageW(edit, EM_SETSEL, 0, 4);
+                SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L"mode"));
+                SendMessageW(edit, WM_UNDO, 0, 0);
+                GetWindowTextW(edit, text, ARRAYSIZE(text));
+                Check(std::wstring(text) == L"show 中文", "selection and undo survive backend migration");
+                HWND fresh = pulse::ui::CreateChildEdit(parent, L"new 中文");
+                SetWindowSubclass(fresh, EditProc, 1, reinterpret_cast<DWORD_PTR>(&compositor));
+                SetWindowPos(fresh, nullptr, 20, 80, 320, 30, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                pulse::ui::PresentChildEdit(compositor, compositor.TextFormat(), D2D1::ColorF(1, 1, 1),
+                    D2D1::ColorF(0, 0, 0), fresh);
+                flags = 0;
+                const bool fresh_native = GetLayeredWindowAttributes(fresh, nullptr, nullptr, &flags) && (flags & LWA_ALPHA);
+                Check(!fresh_native && !GetPropW(fresh, L"Pulse.NativeEditFallback"),
+                    "new editor keeps DirectWrite presentation in every mode");
+                force_present_failure = true;
+                SendMessageW(fresh, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L"fail 中文"));
+                force_present_failure = false;
+                Check(GetPropW(fresh, L"Pulse.NativeEditFallback") &&
+                    !pulse::ui::PresentChildEdit(compositor, compositor.TextFormat(), D2D1::ColorF(1, 1, 1),
+                        D2D1::ColorF(0, 0, 0), fresh), "each text mode retains sticky native fallback after presentation failure");
+                SendMessageW(fresh, EM_SETSEL, 0, 4);
+                SendMessageW(fresh, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L"safe"));
+                SendMessageW(fresh, WM_UNDO, 0, 0);
+                GetWindowTextW(fresh, text, ARRAYSIZE(text));
+                Check(std::wstring(text) == L"fail 中文", "each mode preserves native input and undo after presentation failure");
+                DestroyWindow(fresh);
+            }
             RECT owner{};
             GetWindowRect(parent, &owner);
             SetWindowPos(parent, nullptr, owner.left + 70, owner.top + 40, 0, 0,
@@ -126,6 +262,10 @@ int wmain() {
             SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L"native 中文"));
             GetWindowTextW(edit, text, ARRAYSIZE(text));
             Check(std::wstring(text) == L"native 中文", "editing remains functional after presentation failure");
+            pulse::ui::typography::SetTextRenderMode(pulse::ui::typography::TextRenderMode::Sharp);
+            pulse::ui::typography::SetTextRenderMode(pulse::ui::typography::TextRenderMode::Auto);
+            Check(!pulse::ui::PresentChildEdit(compositor, compositor.TextFormat(), D2D1::ColorF(1, 1, 1),
+                D2D1::ColorF(0, 0, 0), edit), "backend changes preserve a presentation-failure fallback");
             ShowWindow(parent, SW_HIDE);
             Check(!IsWindowVisible(edit), "parent hide automatically hides the editor");
             DestroyWindow(edit);

@@ -18,4 +18,12 @@ struct ShellCommandApi {
 };
 ShellCommandResult LaunchShellCommand(const std::wstring& command, const std::wstring& directory,
     HWND owner, const ShellCommandApi& api = {});
+struct TerminalLaunchResult {
+    DWORD error = ERROR_SUCCESS;
+    DWORD open_error = ERROR_SUCCESS;
+    bool elevation_requested = false;
+};
+std::wstring TerminalCommandLine(const std::wstring& directory);
+TerminalLaunchResult LaunchTerminal(const std::wstring& executable, const std::wstring& arguments,
+    const std::wstring& directory, HWND owner, const ShellCommandApi& api = {});
 }

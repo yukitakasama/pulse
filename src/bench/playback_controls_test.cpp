@@ -30,10 +30,11 @@ bool Until(const std::function<bool()>& condition, unsigned ms = 10000) {
     return false;
 }
 int wmain(int argc, wchar_t** argv) {
+    const bool unsupported_audio_only = argc == 3 && wcscmp(argv[2], L"--unsupported-audio-only") == 0;
     const bool open_only = argc == 3 && wcscmp(argv[2], L"--open-only") == 0;
     const bool end_seek_only = argc == 3 && wcscmp(argv[2], L"--end-seek-only") == 0;
     using namespace pulse::ui::playback;
-    if (!open_only && !end_seek_only) {
+    if (!open_only && !end_seek_only && !unsupported_audio_only) {
         Check(FrameAt(0, 20) == 0 && FrameAt(1, 20) == 19, "GIF seek endpoints are valid frame indices");
         Check(FrameAt(.5, 11) == 5, "GIF seek maps progress to frame");
         Check(FrameAt(-1, 10) == 0 && FrameAt(2, 10) == 9, "GIF seek clamps beyond track");
@@ -46,7 +47,7 @@ int wmain(int argc, wchar_t** argv) {
         Check(VideoPreview::Supports(L"test.MP4") && !VideoPreview::Supports(L"test.gif"), "video selection preserves GIF path");
     }
     if (argc == 2 && wcscmp(argv[1], L"--timeline-only") == 0) return failures ? 1 : 0;
-    if (argc != 2 && !open_only && !end_seek_only) { std::puts("Video runtime tests require an isolated fixture path"); return 2; }
+    if (argc != 2 && !open_only && !end_seek_only && !unsupported_audio_only) { std::puts("Video runtime tests require an isolated fixture path"); return 2; }
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"STATIC",
         L"Pulse playback regression fixture", WS_OVERLAPPEDWINDOW,
@@ -59,7 +60,19 @@ int wmain(int argc, wchar_t** argv) {
     auto state = video.Snapshot();
     std::printf("open HRESULT=%08lx ready=%d size=%ux%u duration=%lld\n",
         static_cast<unsigned long>(state.error), state.ready, state.width, state.height, state.duration);
-    Check(opened && state.ready && SUCCEEDED(state.error), "real MP4 opens through production media worker");
+    if (unsupported_audio_only) {
+        Check(opened && FAILED(state.error) && !state.ready && !state.playing && state.unsupported_audio,
+            "unsupported audio reports the system format limitation without offering playback");
+        video.Open(window, L"Z:\\__pulse_missing_fixture__\\missing.ogg");
+        Check(Until([&] { return FAILED(video.Snapshot().error); }), "missing audio returns an error");
+        Check(!video.Snapshot().unsupported_audio, "missing audio is not mislabeled as a system format limitation");
+        video.Reset();
+        Pump(800);
+        DestroyWindow(window);
+        CoUninitialize();
+        return failures ? 1 : 0;
+    }
+    Check(opened && state.ready && SUCCEEDED(state.error), "real media opens through production media worker");
     if (end_seek_only) {
         if (state.ready) {
             video.Play(false);

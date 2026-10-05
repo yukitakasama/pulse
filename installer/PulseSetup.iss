@@ -152,6 +152,7 @@ Source: "{#BuildDir}\Pulse.Index.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\Pulse.Document.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\Pulse.Preview.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\pulse_shell.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\pulse_elevated.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\pulse_integration.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 #ifndef AppLocalRuntime
@@ -442,6 +443,80 @@ begin
   RemoveDir(Directory);
 end;
 
+{ Preview packs (Settings > Preview packs) live in %LOCALAPPDATA%\Pulse\packs.
+  "remove_on_uninstall" in packs.json (default true) decides whether an
+  uninstall deletes them; upgrades (/PULSEUPGRADE=1) never touch them. }
+function ReadJsonBool(const Json, Key: String; Default: Boolean): Boolean;
+var
+  I, N: Integer;
+  Marker: String;
+begin
+  Result := Default;
+  Marker := '"' + Key + '"';
+  I := Pos(Marker, Json);
+  if I = 0 then
+    Exit;
+  I := I + Length(Marker);
+  N := Length(Json);
+  while (I <= N) and (Json[I] <> ':') do
+    I := I + 1;
+  I := I + 1;
+  while (I <= N) and ((Json[I] = ' ') or (Json[I] = #9) or
+    (Json[I] = #10) or (Json[I] = #13)) do
+    I := I + 1;
+  if Copy(Json, I, 4) = 'true' then
+    Result := True
+  else if Copy(Json, I, 5) = 'false' then
+    Result := False;
+end;
+
+function PreviewPacksDirectory: String;
+begin
+  Result := ExpandConstant('{localappdata}\Pulse\packs');
+end;
+
+function RemovePreviewPacksOnUninstall: Boolean;
+var
+  Json: AnsiString;
+begin
+  Result := True;
+  if LoadStringFromFile(PreviewPacksDirectory + '\packs.json', Json) then
+    Result := ReadJsonBool(String(Json), 'remove_on_uninstall', True);
+end;
+
+{ An uninstall that keeps the user's data still honours the pack setting. }
+procedure RemovePreviewPacksIfWanted;
+begin
+  if (ExpandConstant('{param:PULSEUPGRADE|0}') <> '1') and RemovePreviewPacksOnUninstall then
+    DelTree(PreviewPacksDirectory, True, True, True);
+end;
+
+{ Everything Pulse keeps in %LOCALAPPDATA%\Pulse except the preview packs. }
+procedure DeleteLocalDataKeepingPacks;
+var
+  Root: String;
+  FindRec: TFindRec;
+begin
+  Root := ExpandConstant('{localappdata}\Pulse');
+  if FindFirst(Root + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') and
+          (CompareText(FindRec.Name, 'packs') <> 0) then
+        begin
+          if FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0 then
+            DelTree(Root + '\' + FindRec.Name, True, True, True)
+          else
+            DeleteFile(Root + '\' + FindRec.Name);
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 procedure CleanupPulseData;
 var
   DefaultIndexPath: String;
@@ -452,7 +527,10 @@ begin
       RemoveBackslashUnlessRoot(DefaultIndexPath)) <> 0) then
     DeletePulseIndexArtifacts(UninstallIndexPath);
 
-  DelTree(ExpandConstant('{localappdata}\Pulse'), True, True, True);
+  if RemovePreviewPacksOnUninstall then
+    DelTree(ExpandConstant('{localappdata}\Pulse'), True, True, True)
+  else
+    DeleteLocalDataKeepingPacks;
   DelTree(ExpandConstant('{commonappdata}\Pulse'), True, True, True);
 end;
 
@@ -589,7 +667,9 @@ begin
 
     DeleteShellTagMenu;
     if CleanupUserData then
-      CleanupPulseData;
+      CleanupPulseData
+    else
+      RemovePreviewPacksIfWanted;
   end;
 end;
 

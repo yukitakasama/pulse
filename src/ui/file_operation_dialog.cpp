@@ -35,12 +35,19 @@ struct TransferChrome {
     D2D1_RECT_F details{};
     D2D1_RECT_F pause{};
     D2D1_RECT_F cancel{};
+    D2D1_RECT_F retry{};
+    D2D1_RECT_F skip{};
 };
 
 struct TransferLabels {
     std::wstring details;
     std::wstring pause;
     std::wstring cancel;
+    std::wstring retry;
+    std::wstring skip;
+    bool show_details = true;
+    bool show_retry = false;
+    bool show_skip = false;
     bool show_pause = true;
 };
 
@@ -51,7 +58,14 @@ TransferLabels MakeTransferLabels(const ops::OpStatus& status, bool detailed) {
     labels.pause = status.phase == ops::OpPhase::Paused
         ? l10n::Get(l10n::StringId::OpResume) : l10n::Get(l10n::StringId::OpPause);
     const bool emptying = status.type == ops::OpType::EmptyRecycle;
-    labels.show_pause = !emptying && status.active;
+    const bool authorization = status.authorization != ops::AuthorizationState::None;
+    labels.show_details = !authorization;
+    labels.show_retry = status.active && status.authorization == ops::AuthorizationState::ActionRequired
+        && status.phase != ops::OpPhase::Cancelling;
+    labels.show_skip = labels.show_retry && status.can_skip_authorization;
+    labels.retry = l10n::Get(l10n::StringId::OpRetryAuthorization);
+    labels.skip = l10n::Get(l10n::StringId::OpSkipAuthorization);
+    labels.show_pause = !authorization && !emptying && status.active && status.can_pause;
     labels.cancel = status.active && !emptying
         ? l10n::Get(l10n::StringId::Cancel) : l10n::Get(l10n::StringId::Close);
     return labels;
@@ -79,14 +93,24 @@ TransferChrome MakeTransferChrome(float scale, float width, float height,
         chrome.pause = D2D1::RectF(chrome.cancel.left - gap - pause_w, y0,
                                    chrome.cancel.left - gap, y1);
     }
-    chrome.details = painter.FitButtonBounds(D2D1::RectF(pad, y0, pad, y1),
+    float next_right = chrome.cancel.left - gap;
+    if (labels.show_skip) {
+        const float skip_w = painter.MeasureButtonWidth(labels.skip);
+        chrome.skip = D2D1::RectF(next_right - skip_w, y0, next_right, y1);
+        next_right = chrome.skip.left - gap;
+    }
+    if (labels.show_retry) {
+        const float retry_w = painter.MeasureButtonWidth(labels.retry, L"\xEA18");
+        chrome.retry = D2D1::RectF(next_right - retry_w, y0, next_right, y1);
+    }
+    if (labels.show_details) chrome.details = painter.FitButtonBounds(D2D1::RectF(pad, y0, pad, y1),
                                              labels.details, L"\xE70D");
     return chrome;
 }
 
 void DrawEllipsizedText(Compositor& compositor, IDWriteTextFormat* format,
                         const D2D1_RECT_F& bounds, const std::wstring& text,
-                        const D2D1_COLOR_F& color) {
+                        const D2D1_COLOR_F& color, bool wrap = false) {
     auto* factory = compositor.DwriteFactory();
     auto* dc = compositor.Dc();
     if (!factory || !dc || !format || text.empty()) return;
@@ -96,7 +120,7 @@ void DrawEllipsizedText(Compositor& compositor, IDWriteTextFormat* format,
     ComPtr<IDWriteTextLayout> layout;
     if (FAILED(factory->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
                                          format, width, height, &layout))) return;
-    layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    layout->SetWordWrapping(wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
     layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     ComPtr<IDWriteInlineObject> ellipsis;
     if (SUCCEEDED(factory->CreateEllipsisTrimmingSign(format, &ellipsis))) {
@@ -623,12 +647,23 @@ void FileOperationWindow::SetTheme(bool dark, D2D1_COLOR_F accent) {
 void FileOperationWindow::Update(const ops::OpStatus& status) {
     const bool new_task = status.task_id != status_.task_id;
     const bool was_active = status_.active;
+    if (new_task || status.authorization != status_.authorization) pressed_ = 0;
     status_ = ops::PresentOperationStatus(status);
     if (new_task) {
         speed_history_.clear();
         speed_sample_tick_ = 0;
     }
     if (!hwnd_) return;
+    if (status_.authorization != ops::AuthorizationState::None) {
+        RECT rect{};
+        GetWindowRect(hwnd_, &rect);
+        const int min_width = static_cast<int>(kDlgW * scale_);
+        const int min_height = static_cast<int>(kCollapsedH * scale_);
+        if (rect.right - rect.left < min_width || rect.bottom - rect.top < min_height)
+            SetWindowPos(hwnd_, nullptr, 0, 0, std::max(min_width, static_cast<int>(rect.right - rect.left)),
+                         std::max(min_height, static_cast<int>(rect.bottom - rect.top)),
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
     // The render timer stops once an operation ends; restart it for the next.
     if (status_.active && !was_active && IsWindowVisible(hwnd_))
@@ -684,9 +719,11 @@ int FileOperationWindow::HitTestControl(float x, float y) const {
         painter_, labels);
     if (pulse::ui::ContainsRect(chrome.close, x, y)) return 1;
     if (pulse::ui::ContainsRect(chrome.minimize, x, y)) return 2;
-    if (pulse::ui::ContainsRect(chrome.pause, x, y)) return 3;
+    if (labels.show_retry && pulse::ui::ContainsRect(chrome.retry, x, y)) return 6;
+    if (labels.show_skip && pulse::ui::ContainsRect(chrome.skip, x, y)) return 7;
+    if (labels.show_pause && pulse::ui::ContainsRect(chrome.pause, x, y)) return 3;
     if (pulse::ui::ContainsRect(chrome.cancel, x, y)) return 4;
-    if (pulse::ui::ContainsRect(chrome.details, x, y)) return 5;
+    if (labels.show_details && pulse::ui::ContainsRect(chrome.details, x, y)) return 5;
     return 0;
 }
 
@@ -718,6 +755,8 @@ void FileOperationWindow::Render() {
     const float dip_w = width / std::max(scale_, 0.001f);
     const auto labels = MakeTransferLabels(status_, detailed_);
     const auto chrome = MakeTransferChrome(scale_, width, height, painter_, labels);
+    const bool authorization = status_.authorization != ops::AuthorizationState::None;
+    const bool requesting = status_.authorization == ops::AuthorizationState::Requesting;
     const bool failed = status_.phase == ops::OpPhase::Failed;
     const bool paused = status_.phase == ops::OpPhase::Paused;
     const bool waiting = status_.phase == ops::OpPhase::WaitingForConflict;
@@ -730,7 +769,7 @@ void FileOperationWindow::Render() {
     const bool emptying = status_.type == ops::OpType::EmptyRecycle;
     const D2D1_COLOR_F sky = dark_ ? HexColor(0x38BDF8) : HexColor(0x0284C7);
 
-    const wchar_t* operation_glyph = (deleting || emptying) ? L"\xE74D"
+    const wchar_t* operation_glyph = authorization ? L"\xEA18" : (deleting || emptying) ? L"\xE74D"
         : restoring ? L"\xE777" : (moving ? L"\xE7C2" : L"\xE8C8");
     painter_.DrawGlyph(operation_glyph, Rect(scale_, 14, 10, 16, 16), sky);
     std::wstring title;
@@ -785,7 +824,7 @@ void FileOperationWindow::Render() {
     DrawEllipsizedText(compositor_, compositor_.SmallFormat(),
         Rect(scale_, kPadX, 48, dip_w - kPadX * 2.0f - 72.0f, 18), subtitle, theme.text);
     wchar_t percent[32];
-    if (status_.percent < 0.0f) percent[0] = 0;
+    if (authorization || status_.percent < 0.0f) percent[0] = 0;
     else swprintf_s(percent, L"%.0f%%", std::clamp(status_.percent, 0.0f, 100.0f));
     painter_.DrawText(percent, Rect(scale_, dip_w - kPadX - 56.0f, 46, 56, 20),
                       compositor_.TextFormat(), failed ? theme.danger : sky,
@@ -794,7 +833,13 @@ void FileOperationWindow::Render() {
     std::wstring file_line;
     std::wstring badge_text;
     fluent::BadgeKind badge_kind = fluent::BadgeKind::Success;
-    if (failed) {
+    if (authorization) {
+        file_line = l10n::Get(l10n::StringId::OpItemPrefix) +
+            (status_.current_item.empty() ? src : status_.current_item);
+        badge_text = l10n::Get(requesting ? l10n::StringId::OpAuthorizationRequesting
+                                        : l10n::StringId::OpAuthorizationRequired);
+        badge_kind = fluent::BadgeKind::Warning;
+    } else if (failed) {
         // pulse_shell errors are Simplified; known messages are localized and
         // file names are kept as they are on disk.
         file_line = status_.last_error.empty() ? l10n::Get(l10n::StringId::OpFailed)
@@ -837,8 +882,8 @@ void FileOperationWindow::Render() {
     const auto track = Rect(scale_, kPadX, 98, dip_w - kPadX * 2.0f, 10);
     painter_.FillRoundedRect(track, ScaleDip(scale_, 5.0f),
         dark_ ? HexColor(0xFFFFFF, 0.10f) : HexColor(0x000000, 0.10f));
-    const bool indeterminate = emptying && status_.active && !failed && !completed
-        && status_.percent < 0.0f;
+    const bool indeterminate = requesting || (emptying && status_.active && !failed && !completed
+        && status_.percent < 0.0f);
     if (indeterminate) {
         fluent::ProgressSpec bar;
         bar.bounds = track;
@@ -861,50 +906,60 @@ void FileOperationWindow::Render() {
         }
     }
 
-    const auto stats = Rect(scale_, kPadX, 118, dip_w - kPadX * 2.0f, 52);
+    const auto stats = Rect(scale_, kPadX, 118, dip_w - kPadX * 2.0f, authorization ? 86.0f : 52.0f);
     painter_.FillRoundedRect(stats, ScaleDip(scale_, 12.0f),
         dark_ ? HexColor(0xFFFFFF, 0.05f) : HexColor(0x000000, 0.05f));
-    const bool byte_transfer = status_.type == ops::OpType::Copy
-        || status_.type == ops::OpType::Move;
-    const std::wstring time_text = failed ? l10n::Get(l10n::StringId::OpIncomplete).c_str()
-        : completed ? l10n::Get(l10n::StringId::OpCompleted).c_str()
-        : paused ? l10n::Get(l10n::StringId::OpPaused).c_str()
-        : waiting ? l10n::Get(l10n::StringId::OpWaiting).c_str()
-        : emptying ? l10n::Get(l10n::StringId::OpEmptying)
-        : !byte_transfer ? l10n::Get(l10n::StringId::OpNoEstimate).c_str()
-        : status_.eta_seconds == 0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
-        : l10n::Get(l10n::StringId::OpApprox).c_str() + FormatDuration(status_.eta_seconds);
-    const uint64_t remain_items = status_.total_items > status_.completed_items
-        ? status_.total_items - status_.completed_items : 0;
-    const uint64_t remain_bytes = status_.total_bytes > status_.transferred_bytes
-        ? status_.total_bytes - status_.transferred_bytes : 0;
-    std::wstring items_text;
-    if (completed) items_text = l10n::Get(l10n::StringId::OpZeroItems).c_str();
-    else if (failed && status_.total_items == 0) items_text = L"—";
-    else if (status_.total_items == 0) items_text = l10n::Get(l10n::StringId::OpCalculating).c_str();
-    else if (byte_transfer && status_.total_bytes > 0)
-        items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountBytes).c_str()
-            + pulse::format::ByteSize(remain_bytes) + L")";
-    else items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountSuffix).c_str();
-    const std::wstring speed_text = emptying || !byte_transfer ? L"—"
-        : completed || failed || paused || waiting ? L"0 B/s"
-        : status_.bytes_per_second <= 0.0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
-        : pulse::format::ByteSize(static_cast<uint64_t>(status_.bytes_per_second)) + L"/s";
-    const D2D1_COLOR_F time_color = failed ? theme.danger : theme.text;
-    painter_.DrawText(l10n::Get(l10n::StringId::OpRemainingTime).c_str(), Rect(scale_, 32, 124, 120, 14),
-                      compositor_.SmallFormat(), theme.text_secondary);
-    painter_.DrawText(l10n::Get(l10n::StringId::OpRemainingItems).c_str(), Rect(scale_, 176, 124, 140, 14),
-                      compositor_.SmallFormat(), theme.text_secondary);
-    painter_.DrawText(l10n::Get(l10n::StringId::OpCurrentSpeed).c_str(), Rect(scale_, 328, 124, 110, 14),
-                      compositor_.SmallFormat(), theme.text_secondary);
-    painter_.DrawText(time_text, Rect(scale_, 32, 140, 136, 22),
-                      compositor_.SmallFormat(), time_color);
-    painter_.DrawText(items_text, Rect(scale_, 176, 140, 148, 22),
-                      compositor_.SmallFormat(), theme.text);
-    painter_.DrawText(speed_text, Rect(scale_, 328, 140, 112, 22),
-                      compositor_.SmallFormat(), sky);
+    if (authorization) {
+        const std::wstring explanation = requesting
+            ? l10n::Get(l10n::StringId::OpAuthorizationPrompt)
+            : status_.last_error.empty() ? l10n::Get(l10n::StringId::OpAuthorizationNotGranted)
+                                        : l10n::ServiceErrorText(status_.last_error);
+        painter_.DrawGlyph(L"\xEA18", Rect(scale_, 30, 150, 22, 22), theme.accent);
+        DrawEllipsizedText(compositor_, compositor_.SmallFormat(),
+            Rect(scale_, 62, 124, dip_w - 94, 72), explanation, theme.text, true);
+    } else {
+        const bool byte_transfer = status_.type == ops::OpType::Copy
+            || status_.type == ops::OpType::Move;
+        const std::wstring time_text = failed ? l10n::Get(l10n::StringId::OpIncomplete).c_str()
+            : completed ? l10n::Get(l10n::StringId::OpCompleted).c_str()
+            : paused ? l10n::Get(l10n::StringId::OpPaused).c_str()
+            : waiting ? l10n::Get(l10n::StringId::OpWaiting).c_str()
+            : emptying ? l10n::Get(l10n::StringId::OpEmptying)
+            : !byte_transfer ? l10n::Get(l10n::StringId::OpNoEstimate).c_str()
+            : status_.eta_seconds == 0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
+            : l10n::Get(l10n::StringId::OpApprox).c_str() + FormatDuration(status_.eta_seconds);
+        const uint64_t remain_items = status_.total_items > status_.completed_items
+            ? status_.total_items - status_.completed_items : 0;
+        const uint64_t remain_bytes = status_.total_bytes > status_.transferred_bytes
+            ? status_.total_bytes - status_.transferred_bytes : 0;
+        std::wstring items_text;
+        if (completed) items_text = l10n::Get(l10n::StringId::OpZeroItems).c_str();
+        else if (failed && status_.total_items == 0) items_text = L"—";
+        else if (status_.total_items == 0) items_text = l10n::Get(l10n::StringId::OpCalculating).c_str();
+        else if (byte_transfer && status_.total_bytes > 0)
+            items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountBytes).c_str()
+                + pulse::format::ByteSize(remain_bytes) + L")";
+        else items_text = std::to_wstring(remain_items) + l10n::Get(l10n::StringId::OpCountSuffix).c_str();
+        const std::wstring speed_text = emptying || !byte_transfer ? L"—"
+            : completed || failed || paused || waiting ? L"0 B/s"
+            : status_.bytes_per_second <= 0.0 ? l10n::Get(l10n::StringId::OpEstimating).c_str()
+            : pulse::format::ByteSize(static_cast<uint64_t>(status_.bytes_per_second)) + L"/s";
+        const D2D1_COLOR_F time_color = failed ? theme.danger : theme.text;
+        painter_.DrawText(l10n::Get(l10n::StringId::OpRemainingTime).c_str(), Rect(scale_, 32, 124, 120, 14),
+                          compositor_.SmallFormat(), theme.text_secondary);
+        painter_.DrawText(l10n::Get(l10n::StringId::OpRemainingItems).c_str(), Rect(scale_, 176, 124, 140, 14),
+                          compositor_.SmallFormat(), theme.text_secondary);
+        painter_.DrawText(l10n::Get(l10n::StringId::OpCurrentSpeed).c_str(), Rect(scale_, 328, 124, 110, 14),
+                          compositor_.SmallFormat(), theme.text_secondary);
+        painter_.DrawText(time_text, Rect(scale_, 32, 140, 136, 22),
+                          compositor_.SmallFormat(), time_color);
+        painter_.DrawText(items_text, Rect(scale_, 176, 140, 148, 22),
+                          compositor_.SmallFormat(), theme.text);
+        painter_.DrawText(speed_text, Rect(scale_, 328, 140, 112, 22),
+                          compositor_.SmallFormat(), sky);
+    }
 
-    if (detailed_) {
+    if (detailed_ && !authorization) {
         const auto card = Rect(scale_, kPadX, 180, dip_w - kPadX * 2.0f, 140);
         painter_.FillRoundedRect(card, ScaleDip(scale_, 12.0f),
             dark_ ? HexColor(0x000000, 0.30f) : HexColor(0x000000, 0.05f));
@@ -934,7 +989,7 @@ void FileOperationWindow::Render() {
     fluent::ControlState detail_state{};
     detail_state.hovered = hover_ == 5;
     detail_state.pressed = pressed_ == 5;
-    painter_.DrawButton({ chrome.details, labels.details,
+    if (labels.show_details) painter_.DrawButton({ chrome.details, labels.details,
         detailed_ ? L"\xE70E" : L"\xE70D", fluent::ButtonKind::Transparent, detail_state });
     if (labels.show_pause) {
         fluent::ControlState pause_state{};
@@ -944,6 +999,20 @@ void FileOperationWindow::Render() {
         pause_state.pressed = pressed_ == 3;
         painter_.DrawButton({ chrome.pause, labels.pause, {},
                               fluent::ButtonKind::Standard, pause_state });
+    }
+    if (labels.show_retry) {
+        fluent::ControlState retry_state{};
+        retry_state.hovered = hover_ == 6;
+        retry_state.pressed = pressed_ == 6;
+        painter_.DrawButton({ chrome.retry, labels.retry, L"\xEA18",
+                              fluent::ButtonKind::Primary, retry_state });
+    }
+    if (labels.show_skip) {
+        fluent::ControlState skip_state{};
+        skip_state.hovered = hover_ == 7;
+        skip_state.pressed = pressed_ == 7;
+        painter_.DrawButton({ chrome.skip, labels.skip, {},
+                              fluent::ButtonKind::Standard, skip_state });
     }
     fluent::ControlState cancel_state{};
     cancel_state.enabled = status_.phase != ops::OpPhase::Cancelling;
@@ -992,6 +1061,13 @@ LRESULT FileOperationWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM l
             painter_, labels);
         return pulse::ui::BorderlessHitTest(hwnd_, lparam, ScaleDip(scale_, kTitleH),
             D2D1::RectF(chrome.minimize.left, 0, chrome.close.right, chrome.close.bottom));
+    }
+    case WM_GETMINMAXINFO: {
+        if (status_.authorization == ops::AuthorizationState::None) break;
+        auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+        info->ptMinTrackSize = { static_cast<LONG>(kDlgW * scale_),
+                                 static_cast<LONG>(kCollapsedH * scale_) };
+        return 0;
     }
     case WM_SIZE:
         if (compositor_.Dc() && wparam != SIZE_MINIMIZED)
@@ -1072,6 +1148,13 @@ LRESULT FileOperationWindow::HandleMessage(UINT message, WPARAM wparam, LPARAM l
                 if (status_.phase == ops::OpPhase::Paused) {
                     if (callbacks_.resume) callbacks_.resume();
                 } else if (callbacks_.pause) callbacks_.pause();
+            } else if ((hit == 6 || hit == 7) && status_.active &&
+                       status_.authorization == ops::AuthorizationState::ActionRequired &&
+                       status_.phase != ops::OpPhase::Cancelling) {
+                if (hit == 6 && callbacks_.retry_authorization)
+                    callbacks_.retry_authorization(status_.task_id);
+                else if (hit == 7 && status_.can_skip_authorization && callbacks_.skip_authorization)
+                    callbacks_.skip_authorization(status_.task_id);
             } else if (hit == 5) {
                 detailed_ = !detailed_;
                 ResizeForDetails(true);

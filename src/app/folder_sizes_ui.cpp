@@ -76,7 +76,7 @@ void FillFolderSizes(AppState& s, ui::WindowViewModel& vm) {
                 if (!entry.is_dir || entry.drive_type != 0 || shown.contains(static_cast<int>(i))) continue;
                 const std::wstring path = entry.full_path.empty() ? ChildPath(pane.path, entry.name) : entry.full_path;
                 if (fs::IsVirtualPath(path)) continue;
-                requests.push_back({path, !fs::IsUncPath(path)});
+                requests.push_back({path, !fs::IsUncPath(path), false});
                 ++count;
             }
         }
@@ -87,13 +87,16 @@ void FillFolderSizes(AppState& s, ui::WindowViewModel& vm) {
             const auto dir = app::GetPulseDataDir();
             return dir.empty() ? std::wstring() : dir + L"\\folder_sizes.json";
         });
-    s.folderSizes.SetIndexEnabled(!s.isolatedTest && !s.shot.active);
+    const bool probe_index = (s.isolatedTest || s.shot.active) &&
+        GetEnvironmentVariableW(L"PULSE_TEST_FOLDER_INDEX", nullptr, 0) > 0;
+    s.folderSizes.SetIndexEnabled((!s.isolatedTest && !s.shot.active) || probe_index);
     s.folderSizes.Sync(std::move(requests), std::move(roots));
     using S = app::FolderSizeState;
     using I = l10n::StringId;
     for (const auto& row : rows) {
         const auto value = s.folderSizes.Get(row.path);
         std::wstring text = value.has_value ? format::ByteSize(value.bytes) : L"";
+        if (value.has_value && value.partial) text = L"\u2265 " + text;
         auto suffix = [&](I id) {
             if (!text.empty()) text += L" · ";
             text += l10n::Get(id);

@@ -4,6 +4,9 @@
 #define NTDDI_VERSION 0x06030000
 #include "video_preview.h"
 #include "../common/path_utils.h"
+#include "../common/preview_packs.h"
+#include "ffmpeg_playback.h"
+#include "../common/preview_extensions.h"
 #include <mfplay.h>
 #include <mfapi.h>
 #include <mfreadwrite.h>
@@ -13,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cwctype>
 #include <deque>
 #include <mutex>
@@ -159,6 +163,9 @@ bool MissingVideoDecoder(const std::wstring& path, CodecInfo& info) {
 } // namespace
 
 struct VideoPreview::Shared {
+    HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    ~Shared() { if (wake) CloseHandle(wake); }
+    void Wake() { if (wake) SetEvent(wake); }
     std::mutex mutex;
     State snapshot;
     std::atomic<bool> stop{false};
@@ -170,11 +177,29 @@ struct VideoPreview::Shared {
     double seek_fraction = 0;
     unsigned steps = 0;
     bool audio_dirty = true;  // volume / mute / rate to apply on the player thread
+    // FFmpeg playback: the latest picture. The owner composes it (a GDI child
+    // would not show in a WS_EX_NOREDIRECTIONBITMAP window).
+    std::shared_ptr<const FfmpegFrame> frame;
+    uint64_t frame_serial = 0;
 };
 
 VideoPreview::~VideoPreview() { Reset(); }
 
 namespace {
+// Pack resolution is cached (one tick-count compare), so this is cheap on paint.
+bool MediaPackPlayable() {
+    return packs::ResolvePack(packs::PackId::Media).source != packs::ToolSource::None;
+}
+
+// Formats Media Foundation is asked to open at all.
+bool NativeExtension(const std::wstring& ext) {
+    for (const auto* known : {L".mp4", L".m4v", L".mov", L".wmv", L".avi", L".mkv", L".webm", L".mpg",
+                              L".mpeg", L".m2ts", L".mts", L".3gp", L".mp3", L".wav", L".flac", L".m4a",
+                              L".aac", L".wma", L".ogg", L".oga", L".opus", L".aif", L".aiff"})
+        if (ext == known) return true;
+    return false;
+}
+
 std::wstring LowerExtension(const std::wstring& path) {
     const auto dot = path.find_last_of(L'.');
     if (dot == std::wstring::npos) return {};
@@ -186,18 +211,14 @@ std::wstring LowerExtension(const std::wstring& path) {
 
 bool VideoPreview::IsAudio(const std::wstring& path) {
     const std::wstring ext = LowerExtension(path);
-    for (const auto* audio : {L".mp3", L".wav", L".flac", L".m4a", L".aac", L".wma",
-                              L".ogg", L".oga", L".opus", L".aif", L".aiff"})
-        if (ext == audio) return true;
-    return false;
+    return preview::IsAudioExtension(ext) ||
+        (ffmpeg::IsAudioExtension(ext) && MediaPackPlayable());
 }
 
 bool VideoPreview::Supports(const std::wstring& path) {
     const std::wstring ext = LowerExtension(path);
-    for (const auto* video : {L".mp4", L".m4v", L".mov", L".wmv", L".avi", L".mkv",
-                              L".webm", L".mpg", L".mpeg", L".m2ts", L".mts", L".3gp"})
-        if (ext == video) return true;
-    return IsAudio(path);
+    return preview::IsVideoExtension(ext) || preview::IsAudioExtension(ext) ||
+        ((ffmpeg::IsVideoExtension(ext) || ffmpeg::IsAudioExtension(ext)) && MediaPackPlayable());
 }
 
 LRESULT CALLBACK VideoPreview::VideoProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -210,6 +231,7 @@ LRESULT CALLBACK VideoPreview::VideoProc(HWND hwnd, UINT message, WPARAM wparam,
     }
     if (message == WM_NCDESTROY && holder) {
         (*holder)->stop.store(true);
+        (*holder)->Wake();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         delete holder;
     }
@@ -260,7 +282,7 @@ void VideoPreview::Open(HWND owner, const std::wstring& path) {
 }
 
 void VideoPreview::Reset() {
-    if (state_) state_->stop.store(true);
+    if (state_) { state_->stop.store(true); state_->Wake(); }
     if (child_) {
         ShowWindow(child_, SW_HIDE);
         // Retire the render target only after MFPlay has released it. The child
@@ -280,6 +302,7 @@ void VideoPreview::Layout(const RECT& bounds, bool visible, int corner_radius) {
     SetWindowPos(child_, nullptr, bounds.left, bounds.top, width, height,
         SWP_NOACTIVATE | SWP_NOZORDER | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
     if (width != region_size_.cx || height != region_size_.cy || corner_radius != region_radius_) {
+        if (state_) state_->Wake();
         region_size_ = SIZE{width, height};
         region_radius_ = corner_radius;
         // The window owns the region after SetWindowRgn.
@@ -290,6 +313,13 @@ void VideoPreview::Layout(const RECT& bounds, bool visible, int corner_radius) {
     }
 }
 
+std::shared_ptr<const FfmpegFrame> VideoPreview::Frame(uint64_t& serial) const {
+    if (!state_) return nullptr;
+    std::lock_guard lock(state_->mutex);
+    serial = state_->frame_serial;
+    return state_->frame;
+}
+
 VideoPreview::State VideoPreview::Snapshot() const {
     if (!state_) return {};
     std::lock_guard lock(state_->mutex);
@@ -297,6 +327,7 @@ VideoPreview::State VideoPreview::Snapshot() const {
 }
 void VideoPreview::Play(bool playing) {
     if (!state_) return;
+    struct Notify { Shared* state; ~Notify() { state->Wake(); } } notify{state_.get()};
     std::lock_guard lock(state_->mutex);
     state_->playing = playing;
     state_->snapshot.playing = playing;
@@ -309,6 +340,7 @@ void VideoPreview::Play(bool playing) {
 }
 void VideoPreview::Seek(double fraction) {
     if (!state_) return;
+    struct Notify { Shared* state; ~Notify() { state->Wake(); } } notify{state_.get()};
     std::lock_guard lock(state_->mutex);
     if (!state_->snapshot.can_seek || state_->snapshot.duration <= 0) return;
     state_->seek_fraction = std::clamp(fraction, 0.0, 1.0);
@@ -318,24 +350,28 @@ void VideoPreview::Seek(double fraction) {
 }
 void VideoPreview::SetVolume(float volume) {
     if (!state_) return;
+    struct Notify { Shared* state; ~Notify() { state->Wake(); } } notify{state_.get()};
     std::lock_guard lock(state_->mutex);
     state_->snapshot.volume = std::clamp(volume, 0.0f, 1.0f);
     state_->audio_dirty = true;
 }
 void VideoPreview::SetMuted(bool muted) {
     if (!state_) return;
+    struct Notify { Shared* state; ~Notify() { state->Wake(); } } notify{state_.get()};
     std::lock_guard lock(state_->mutex);
     state_->snapshot.muted = muted;
     state_->audio_dirty = true;
 }
 void VideoPreview::SetRate(float rate) {
     if (!state_) return;
+    struct Notify { Shared* state; ~Notify() { state->Wake(); } } notify{state_.get()};
     std::lock_guard lock(state_->mutex);
     state_->snapshot.rate = std::clamp(rate, 0.25f, 4.0f);
     state_->audio_dirty = true;
 }
 void VideoPreview::Step() {
     if (!state_) return;
+    struct Notify { Shared* state; ~Notify() { state->Wake(); } } notify{state_.get()};
     std::lock_guard lock(state_->mutex);
     if (!state_->snapshot.ready || state_->snapshot.ended) return;
     state_->playing = false;
@@ -362,6 +398,9 @@ void VideoPreview::Run(std::shared_ptr<Shared> state, std::wstring path) {
         state->snapshot.error = hr;
         state->snapshot.ready = false;
         state->snapshot.playing = false;
+        state->snapshot.unsupported_audio = IsAudio(path) &&
+            (hr == MF_E_UNSUPPORTED_BYTESTREAM_TYPE || hr == MF_E_INVALIDMEDIATYPE ||
+             hr == MF_E_TOPO_CODEC_NOT_FOUND);
     };
     if (FAILED(com)) { fail(com); return; }
     if (!IsAudio(path) && !state->stop.load()) {
@@ -373,6 +412,18 @@ void VideoPreview::Run(std::shared_ptr<Shared> state, std::wstring path) {
             state->snapshot.codec_name = codec.name;
             state->snapshot.store_id = codec.store;
         }
+    }
+    // The FFmpeg preview pack takes over what Media Foundation cannot play:
+    // containers it does not know, and videos without an installed decoder.
+    const std::wstring pack_ffmpeg = packs::PackToolPath(packs::PackId::Media, L"ffmpeg.exe");
+    const bool mf_format = NativeExtension(LowerExtension(path));
+    if (!pack_ffmpeg.empty() && !state->stop.load() && (!mf_format || state->snapshot.missing_decoder)) {
+        if (RunFfmpeg(state, path, pack_ffmpeg)) { CoUninitialize(); return; }
+    }
+    if (!mf_format) {
+        fail(MF_E_UNSUPPORTED_BYTESTREAM_TYPE);
+        CoUninitialize();
+        return;
     }
     library = LoadLibraryExW(L"mfplay.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     using CreatePlayer = HRESULT (WINAPI*)(LPCWSTR, BOOL, MFP_CREATION_OPTIONS,
@@ -553,6 +604,181 @@ void VideoPreview::Run(std::shared_ptr<Shared> state, std::wstring path) {
     player.Reset();
     events.Reset();
     if (library) FreeLibrary(library);
+    // Media Foundation could not open it at all (e.g. MKV with an unknown
+    // audio codec, broken indexes): let the pack try before giving up.
+    if (!ready && FAILED(hr) && !pack_ffmpeg.empty() && !state->stop.load())
+        RunFfmpeg(state, path, pack_ffmpeg);
     CoUninitialize();
+}
+
+bool VideoPreview::RunFfmpeg(const std::shared_ptr<Shared>& state, const std::wstring& path,
+                             const std::wstring& ffmpeg_exe) {
+    FfmpegMediaInfo info;
+    const std::wstring media_path = pulse::path::StripExtendedPathPrefix(path);
+    if (state->stop.load() || !ProbeFfmpegMedia(ffmpeg_exe, media_path, info, &state->stop) || state->stop.load()) return false;
+    const bool audio_file = IsAudio(path);
+    if (audio_file ? !info.audio : !info.video) return false;
+    if (audio_file) info.video = false;   // cover art is drawn by the Quick Look itself
+
+    float rate = 1.0f, volume = 1.0f;
+    bool muted = false;
+    {
+        std::lock_guard lock(state->mutex);
+        auto& s = state->snapshot;
+        s.ready = false;
+        s.error = S_OK;
+        s.control_error = S_OK;
+        s.missing_decoder = false;
+        s.unsupported_audio = false;
+        s.codec.clear();
+        s.codec_name.clear();
+        s.store_id = nullptr;
+        s.ffmpeg = true;
+        s.width = info.video ? info.width : 0;
+        s.height = info.video ? info.height : 0;
+        s.duration = info.duration;
+        s.can_seek = info.duration > 0;
+        rate = s.rate;
+        volume = s.volume;
+        muted = s.muted;
+        state->audio_dirty = false;
+        state->seek_pending = false;
+        state->steps = 0;
+    }
+    // Frames are scaled for the Quick Look's client area (the video child may
+    // not be laid out yet); a much larger window later restarts the decoder.
+    auto box = [&] {
+        RECT client{};
+        GetClientRect(GetParent(state->child), &client);
+        return SIZE{(std::max)(client.right - client.left, 320L), (std::max)(client.bottom - client.top, 180L)};
+    };
+    FfmpegPlayback player(ffmpeg_exe, media_path, info, [state] { state->Wake(); });
+    player.SetVolume(volume, muted);
+    bool playing = false;
+    {
+        std::lock_guard lock(state->mutex);
+        playing = state->playing;
+    }
+    player.Start(0, rate, box(), playing);
+    // 1 ms timer resolution only while frames are being paced.
+    struct TimerResolution {
+        bool on = false;
+        void Set(bool want) {
+            if (want == on) return;
+            on = want;
+            if (want) timeBeginPeriod(1); else timeEndPeriod(1);
+        }
+        ~TimerResolution() { Set(false); }
+    } resolution;
+    bool ended = false;
+    uint32_t stepped = 0;
+    SIZE grown_box{};
+    ULONGLONG grown_since = 0;
+    while (!state->stop.load()) {
+        bool want_play = false, seek = false, step = false, dirty = false;
+        double fraction = 0;
+        float wanted_rate = rate;
+        {
+            std::lock_guard lock(state->mutex);
+            want_play = state->playing;
+            if (state->seek_pending) {
+                seek = true;
+                fraction = state->seek_fraction;
+                state->seek_pending = false;
+            }
+            if (state->steps && !want_play) {
+                step = true;
+                --state->steps;
+            }
+            if (state->audio_dirty) {
+                dirty = true;
+                state->audio_dirty = false;
+                volume = state->snapshot.volume;
+                muted = state->snapshot.muted;
+                wanted_rate = state->snapshot.rate;
+            }
+        }
+        if (dirty) {
+            player.SetVolume(volume, muted);
+            if (std::fabs(wanted_rate - rate) > 0.001f) {
+                rate = wanted_rate;
+                if (!ended) player.Start(player.Position(), rate, player.frame_size(), want_play);
+            }
+        }
+        if (seek && info.duration > 0) {
+            // Stay clear of the very end, where some files decode no frame.
+            const int64_t last = info.duration - (std::min)(info.duration / 2, int64_t{5'000'000});
+            player.Start((std::min)(last, static_cast<int64_t>(fraction * static_cast<double>(info.duration))),
+                         rate, box(), want_play);
+            ended = false;
+            stepped = 0;
+        } else if (want_play != player.playing() && !ended) {
+            player.SetPlaying(want_play);
+        }
+        if (step) {
+            if (player.Step()) ++stepped;
+            else {
+                std::lock_guard lock(state->mutex);
+                ++state->steps;   // the next frame is still decoding
+            }
+        }
+        // Grow the frames once the window has been much larger for a moment.
+        if (info.video && !ended) {
+            const SIZE now_box = box();
+            const SIZE fit = FfmpegFrameSize(info.width, info.height,
+                                             {(std::min)(now_box.cx, 1920L), (std::min)(now_box.cy, 1080L)});
+            const SIZE have = player.frame_size();
+            if (static_cast<double>(fit.cx) * fit.cy > 1.4 * have.cx * have.cy) {
+                if (now_box.cx != grown_box.cx || now_box.cy != grown_box.cy) {
+                    grown_box = now_box;
+                    grown_since = GetTickCount64();
+                } else if (GetTickCount64() - grown_since > 400) {
+                    player.Start(player.Position(), rate, now_box, want_play);
+                    grown_box = {};
+                }
+            } else {
+                grown_box = {};
+            }
+        }
+        if (auto frame = player.Pump()) {
+            {
+                std::lock_guard lock(state->mutex);
+                state->frame = std::move(frame);
+                ++state->frame_serial;
+            }
+            InvalidateRect(GetParent(state->child), nullptr, FALSE);
+        }
+        if (!ended && player.Ended()) {
+            ended = true;
+            std::lock_guard lock(state->mutex);
+            state->playing = false;
+        }
+        const bool failed = player.Failed();
+        {
+            std::lock_guard lock(state->mutex);
+            auto& s = state->snapshot;
+            s.ready = !failed;
+            s.playing = state->playing && !ended;
+            s.ended = ended;
+            s.busy = false;
+            s.position = ended ? info.duration : player.Position();
+            s.stepped_frames = stepped;
+            s.rate = rate;
+            if (failed) s.error = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        }
+        if (failed) {
+            const std::string diagnostic = player.Diagnostic();
+            OutputDebugStringA(diagnostic.c_str());
+            break;
+        }
+        const bool pacing = want_play && !ended;
+        resolution.Set(pacing && info.video);
+        // Paused/ended playback sleeps until a command, resize or decoded frame.
+        // A pending resize gets one delayed wake to finish its debounce.
+        const DWORD delay = pacing ? 4 : grown_box.cx ? 400 : INFINITE;
+        if (state->wake) WaitForSingleObject(state->wake, delay);
+        else Sleep(100);
+    }
+    return true;
 }
 } // namespace pulse::ui

@@ -38,6 +38,16 @@ void DeleteValue(const std::wstring& path, const wchar_t* name) {
         RegCloseKey(key);
     }
 }
+void SetLegacyOrphans() {
+    for (const auto* group : {L"Directory", L"Drive"}) {
+        const auto shell = std::wstring(L"Software\\Classes\\") + group + L"\\shell";
+        Set(shell, L"", L"open");
+        Set(shell + L"\\open", L"DelegateExecute", L"");
+    }
+    Set(L"Software\\Classes\\CLSID\\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\\shell\\opennewwindow\\command", L"DelegateExecute", L"");
+    Set(L"Software\\Classes\\CLSID\\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\shell", L"", L"open");
+    Set(L"Software\\Classes\\CLSID\\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\shell\\open\\command", L"DelegateExecute", L"");
+}
 }
 
 int wmain() {
@@ -50,6 +60,32 @@ int wmain() {
     const std::wstring shell = L"Software\\Classes\\Directory\\shell", command = shell + L"\\open\\command";
     const std::wstring win = L"Software\\Classes\\CLSID\\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\\shell\\opennewwindow\\command";
     const std::wstring pc = L"Software\\Classes\\CLSID\\{20D04FE0-3AEA-1069-A2D8-08002B30309D}\\shell";
+    SetLegacyOrphans();
+    Check(HasLegacyShellIntegrationResidue(), "remote seven-value orphan signature is detected without a command or snapshot");
+    Check(ApplyShellIntegration(ShellIntegrationKind::ThisPc, exe, false) && HasLegacyShellIntegrationResidue(),
+        "ordinary disable does not infer ownership of a legacy orphan");
+    Check(!ApplyShellIntegration(ShellIntegrationKind::ThisPc, exe, true) && HasLegacyShellIntegrationResidue() &&
+        !Read(L"Software\\Pulse\\ShellIntegration\\Backups\\v1\\ThisPc", L"Snapshot").exists,
+        "enable requires explicit repair instead of backing up damaged legacy overrides as originals");
+    Set(shell + L"\\ThirdParty\\command", L"", L"third party command");
+    Check(RepairLegacyShellIntegrationResidue() && !HasLegacyShellIntegrationResidue() &&
+        !KeyExists(pc) && !KeyExists(win) && !Read(shell).exists &&
+        Read(shell + L"\\ThirdParty\\command").exists &&
+        Read(L"Software\\Pulse\\ShellIntegration\\Backups\\v1\\LegacyOrphanRepair", L"Snapshot").exists,
+        "explicit legacy repair backs up seven values and preserves third-party menus");
+    Check(!RepairLegacyShellIntegrationResidue() && Read(shell + L"\\ThirdParty\\command").exists,
+        "repeated repair makes no changes after residue is gone");
+    Clear(); SetLegacyOrphans(); Set(pc + L"\\open\\command", L"", L"foreign command");
+    Check(!HasLegacyShellIntegrationResidue() && !RepairLegacyShellIntegrationResidue() && Read(shell).exists,
+        "a new command aborts the entire legacy repair before writes");
+    Clear(); SetLegacyOrphans(); Set(win, L"DelegateExecute", L"foreign delegate");
+    Check(!HasLegacyShellIntegrationResidue() && !RepairLegacyShellIntegrationResidue() && Read(shell).exists,
+        "a changed delegate aborts the entire legacy repair before writes");
+    Clear(); SetLegacyOrphans();
+    Set(L"Software\\Pulse\\ShellIntegration\\Backups\\v1\\LegacyOrphanRepair", L"Snapshot", L"different existing backup", REG_BINARY);
+    Check(!RepairLegacyShellIntegrationResidue() && HasLegacyShellIntegrationResidue(),
+        "an incompatible backup prevents all repair writes");
+    Clear();
     Set(command, L"", L"%OTHER%\\manager.exe %1", REG_EXPAND_SZ);
     Set(command, L"DelegateExecute", L"", REG_SZ);
     Set(shell, L"", L"browse", REG_EXPAND_SZ);
@@ -101,11 +137,26 @@ int wmain() {
         Check(!ApplyShellIntegration(ShellIntegrationKind::WinE, exe, false) && !KeyExists(win.substr(0, win.find(L"\\shell"))),
             "snapshot-backed partial restore is repairable without preserving the broken override");
     }
+    for (const auto kind : {ShellIntegrationKind::WinE, ShellIntegrationKind::ThisPc}) {
+        Clear();
+        const auto path = kind == ShellIntegrationKind::WinE ? win : pc + L"\\open\\command";
+        Check(ApplyShellIntegration(kind, exe, true), "enable isolated namespace override");
+        DeleteValue(path, L"");
+        Check(HasShellIntegrationOwnership(kind, exe) && !ReadShellIntegration(kind, exe),
+            "removed command retains detectable snapshot-backed Explorer override for repair");
+        Check(!HasShellIntegrationOwnership(kind, next), "partial restore provenance belongs to the recorded executable");
+        Check(ApplyShellIntegration(kind, exe, false) && !KeyExists(path.substr(0, path.find(L"\\shell"))) &&
+            !HasShellIntegrationOwnership(kind, exe), "retry clears partial namespace override and repair state");
+        Check(ApplyShellIntegration(kind, exe, true), "capture completed restore provenance");
+        RegDeleteTreeW(HKEY_CURRENT_USER, path.substr(0, path.find(L"\\shell")).c_str());
+        Check(!HasShellIntegrationOwnership(kind, exe), "stale snapshot without remaining overrides is not ownership");
+    }
     Clear();
     Set(win, L"", L"\"" + exe + L"\""); Set(win, L"DelegateExecute", L"");
     Check(ApplyShellIntegration(ShellIntegrationKind::WinE, exe, true), "capture legacy ownership for external handler test");
     DeleteValue(win, L""); Set(win, L"DelegateExecute", L"{11111111-2222-3333-4444-555555555555}");
     const auto later_delegate = Read(win, L"DelegateExecute");
+    Check(!HasShellIntegrationOwnership(ShellIntegrationKind::WinE, exe), "external COM handler is not reported as a Pulse residual");
     ApplyShellIntegration(ShellIntegrationKind::WinE, exe, false);
     Check(Read(win, L"DelegateExecute") == later_delegate, "partial restore preserves a later external COM handler");
     Clear();

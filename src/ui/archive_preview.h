@@ -37,12 +37,16 @@ public:
     bool Scroll(float wheel_steps);
     bool ScrollPixels(float dy);
     bool Click(float x, float y);
+    // Select the hit row without expanding it; blank space clears selection.
+    bool SelectAt(float x, float y);
+    bool SelectedIsDirectory() const;
     bool Hover(float x, float y);
     bool Leave();
     bool Key(UINT vk);
     bool SetFilter(const std::wstring& query);
     bool Contains(float x, float y) const noexcept;
     bool HasSelection() const noexcept { return selected_ >= 0; }
+    std::wstring StateNote() const;
     uint32_t FilterHits() const noexcept { return filter_hits_; }
     // Quick Look folder contents (payload format DIR, folder_listing.h).
     bool IsFolderListing() const noexcept { return parsed_ && folder_; }
@@ -78,6 +82,8 @@ private:
     void Fill(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, float radius,
               const D2D1_COLOR_F& color);
     float Measure(IDWriteTextFormat* format, const std::wstring& text) const;
+    float StateNoteHeight(float width) const;
+    void DrawStateNote(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, const Theme& theme);
     float DrawHeader(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, const Theme& theme,
                      bool large);
     float DrawMix(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, const Theme& theme,
@@ -90,7 +96,6 @@ private:
     void ClampScroll();
     void RevealSelection();
     float RowHeight() const noexcept;
-    std::wstring StateNote() const;  // counting / limit note, empty when complete
 
     // Model
     bool parsed_ = false;

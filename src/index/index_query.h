@@ -65,6 +65,7 @@ struct CompiledQuery {
 
 CompiledQuery ParseQuery(std::wstring_view raw);
 std::wstring FilenameQueryText(std::wstring_view raw);
+std::wstring QueryWithoutPathPrefix(std::wstring_view raw);
 bool QueryCanNarrow(std::wstring_view prev, std::wstring_view next);
 bool QueryUsesAttrs(const CompiledQuery& q);
 size_t QueryPrimaryNameLen(const CompiledQuery& q);
@@ -78,6 +79,8 @@ bool MatchName(const wchar_t* s, uint32_t n, const Term& t);
 bool MatchExt(const wchar_t* s, uint32_t n, const Term& t);
 bool MatchSize(uint64_t bytes, const Term& t);
 bool MatchDate(uint64_t filetime, const Term& t);
+bool MatchTerm(std::wstring_view path, std::wstring_view name, bool is_dir,
+               uint64_t size, uint64_t modified, const Term& term);
 int RankName(const wchar_t* s, uint32_t n, bool is_dir, const CompiledQuery& q);
 
 } // namespace pulse::index

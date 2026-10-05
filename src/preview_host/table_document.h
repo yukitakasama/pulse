@@ -11,6 +11,14 @@
 //   R\t<cell>\t<cell>...   one per row of the preceding sheet; a cell that
 //       starts with "\B" is bold (XLSX styles).
 //   X\t<source>            CSV only: the decoded text for the source view.
+//   W\t<total>\t<read>\t<selected> XLSX: total sheets, read parts (0/1), and
+//       the requested zero-based workbook sheet index.
+// XLSX S.detail explains unavailable sheets: hidden, missing-relationship,
+// not-loaded (request this sheet on selection), time-limit, payload-limit,
+// or read-failed. Only the selected sheet contains rows; not-loaded is not
+// truncation. Hidden sheets remain listed but are not read.
+// S records retain workbook order, including unavailable/hidden sheets; if
+// metadata itself exceeds the payload budget W.total exceeds the S count.
 #pragma once
 
 #include <cstdint>
@@ -31,6 +39,7 @@ bool IsSpreadsheetExtension(std::wstring_view extension);  // .xlsx / .xlsm
 bool MakeCsvTable(const std::wstring& path, std::wstring_view extension, std::wstring& payload,
                   uint32_t& bytes_read, bool& truncated, ipc::PreviewTextEncoding& encoding);
 // Needs the system libarchive (archiveint.dll, Windows 10 1803+) via ReadZipEntry.
-bool MakeXlsxTable(const std::wstring& path, std::wstring& payload, uint32_t& bytes_read);
+bool MakeXlsxTable(const std::wstring& path, std::wstring& payload, uint32_t& bytes_read,
+                   uint32_t sheet_index = 0);
 
 }  // namespace pulse::preview

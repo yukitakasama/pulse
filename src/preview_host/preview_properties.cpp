@@ -1,6 +1,9 @@
 #include "preview_properties.h"
 #include "preview_file_utils.h"
 #include "video_codec.h"
+#include "image_pack.h"
+#include "raw_pack.h"
+#include "media_pack.h"
 #include "../common/preview_extensions.h"
 #include <windows.h>
 #include <shobjidl.h>
@@ -9,6 +12,7 @@
 #include <propkey.h>
 #include <propvarutil.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -53,43 +57,90 @@ bool ReadUintProperty(IPropertyStore* store, REFPROPERTYKEY key, uint32_t& value
 
 namespace pulse::preview {
 
-std::vector<PreviewPropertyValue> ReadProperties(const std::wstring& path) {
+static std::vector<PreviewPropertyValue> ReadShellProperties(const std::wstring& path) {
     std::vector<PreviewPropertyValue> out;
     const std::wstring shell_path = ShellPath(path);
     ComPtr<IPropertyStore> store;
     if (FAILED(SHGetPropertyStoreFromParsingName(shell_path.c_str(), nullptr, GPS_BESTEFFORT,
                                                  IID_PPV_ARGS(&store)))) return out;
+    return ReadPropertiesFromStore(path, store.Get());
+}
+
+std::vector<PreviewPropertyValue> ReadPropertiesFromStore(const std::wstring& path, IPropertyStore* store) {
+    std::vector<PreviewPropertyValue> out;
     const std::wstring extension = ExtensionOf(path);
-    if (IsOneOf(extension, {L".jpg", L".jpeg", L".png", L".gif", L".bmp", L".tif", L".tiff", L".webp", L".heic"})) {
-        AddProperty(store.Get(), PKEY_Image_Dimensions, L"尺寸", out);
-        AddProperty(store.Get(), PKEY_Photo_DateTaken, L"拍摄时间", out);
-        AddProperty(store.Get(), PKEY_Photo_CameraModel, L"相机", out);
-    } else if (IsOneOf(extension, {L".mp4", L".mkv", L".mov", L".avi", L".webm", L".wmv", L".m4v"})) {
-        AddProperty(store.Get(), PKEY_Media_Duration, L"时长", out);
+    if (IsImageExtension(extension)) {
+        AddProperty(store, PKEY_Image_Dimensions, L"尺寸", out);
+        AddProperty(store, PKEY_Photo_DateTaken, L"拍摄时间", out);
+        AddProperty(store, PKEY_Photo_CameraModel, L"相机", out);
+    } else if (IsVideoExtension(extension)) {
+        AddProperty(store, PKEY_Media_Duration, L"时长", out);
         uint32_t width = 0, height = 0;
-        if (out.size() < 6 && ReadUintProperty(store.Get(), PKEY_Video_FrameWidth, width) &&
-            ReadUintProperty(store.Get(), PKEY_Video_FrameHeight, height) &&
+        if (out.size() < 6 && ReadUintProperty(store, PKEY_Video_FrameWidth, width) &&
+            ReadUintProperty(store, PKEY_Video_FrameHeight, height) &&
             width > 0 && height > 0) {
             wchar_t dims[64];
             swprintf_s(dims, L"%u x %u", width, height);
             out.push_back({ L"分辨率", dims });
         }
-        AddProperty(store.Get(), PKEY_Video_FrameRate, L"帧率", out);
-        AddProperty(store.Get(), PKEY_Video_Compression, L"编码格式", out);
-    } else if (IsOneOf(extension, {L".mp3", L".wav", L".flac", L".m4a", L".aac", L".wma",
-                                   L".ogg", L".oga", L".opus", L".aif", L".aiff"})) {
-        AddProperty(store.Get(), PKEY_Title, L"标题", out);
-        AddProperty(store.Get(), PKEY_Music_Artist, L"艺术家", out);
-        AddProperty(store.Get(), PKEY_Music_AlbumTitle, L"专辑", out);
-        AddProperty(store.Get(), PKEY_Media_Duration, L"时长", out);
-        AddProperty(store.Get(), PKEY_Audio_EncodingBitrate, L"比特率", out);
-        AddProperty(store.Get(), PKEY_Audio_SampleRate, L"采样率", out);
+        AddProperty(store, PKEY_Video_FrameRate, L"帧率", out);
+        AddProperty(store, PKEY_Video_Compression, L"编码格式", out);
+    } else if (IsAudioExtension(extension)) {
+        AddProperty(store, PKEY_Title, L"标题", out);
+        AddProperty(store, PKEY_Music_Artist, L"艺术家", out);
+        AddProperty(store, PKEY_Music_AlbumTitle, L"专辑", out);
+        AddProperty(store, PKEY_Media_Duration, L"时长", out);
+        AddProperty(store, PKEY_Audio_EncodingBitrate, L"比特率", out);
+        AddProperty(store, PKEY_Audio_SampleRate, L"采样率", out);
     } else if (IsOneOf(extension, {L".pdf", L".doc", L".docx", L".xls", L".xlsx", L".ppt", L".pptx", L".odt", L".ods", L".odp"})) {
-        AddProperty(store.Get(), PKEY_Title, L"标题", out);
-        AddProperty(store.Get(), PKEY_Author, L"作者", out);
-        AddProperty(store.Get(), PKEY_Document_PageCount, L"页数", out);
+        AddProperty(store, PKEY_Title, L"标题", out);
+        AddProperty(store, PKEY_Author, L"作者", out);
+        AddProperty(store, PKEY_Document_PageCount, L"页数", out);
     }
     return out;
+}
+
+std::vector<PreviewPropertyValue> ReadProperties(const std::wstring& path) {
+    std::vector<PreviewPropertyValue> out = ReadShellProperties(path);
+    // FFmpeg preview pack: fill in what Windows could not read - containers
+    // it has no property handler for (FLV, RMVB, APE...) or streams it has no
+    // decoder for. Files the shell describes fully never start ffprobe.
+    constexpr size_t kMaxRows = 6;
+    const std::wstring extension = ExtensionOf(path);
+    const bool video = IsMediaPackVideoExtension(extension);
+    if (out.size() < kMaxRows && (video || IsMediaPackAudioExtension(extension)) && MediaPackAvailable()) {
+        auto has = [&](const wchar_t* label) {
+            return std::any_of(out.begin(), out.end(), [&](const PreviewPropertyValue& row) { return row.label == label; });
+        };
+        if (!has(L"时长") || (video && !has(L"编码格式"))) MediaPackProperties(path, out, kMaxRows);
+    }
+    if (out.size() < kMaxRows && IsFamilyExtension(PreviewFamily::Raw, extension) && RawPackAvailable() &&
+        std::none_of(out.begin(), out.end(), [](const PreviewPropertyValue& row) { return row.label == L"尺寸"; }))
+        RawPackProperties(path, out, kMaxRows);
+    // Image preview pack: pictures Windows has no property handler for
+    // (AVIF, JPEG XL, EXR...). Reads headers only.
+    if (out.size() < kMaxRows && IsImagePackExtension(extension) && ImagePackAvailable() &&
+        std::none_of(out.begin(), out.end(), [](const PreviewPropertyValue& row) { return row.label == L"尺寸"; }))
+        ImagePackProperties(path, out, kMaxRows);
+    return out;
+}
+
+uint32_t ReadMediaDurationMs(const std::wstring& path) {
+    if (!IsOneOf(ExtensionOf(path), {L".mp4", L".mkv", L".mov", L".avi", L".webm", L".wmv",
+                                     L".m4v", L".mpg", L".mpeg", L".ts", L".mts", L".m2ts",
+                                     L".3gp", L".flv"}))
+        return 0;
+    ComPtr<IPropertyStore> store;
+    if (FAILED(SHGetPropertyStoreFromParsingName(ShellPath(path).c_str(), nullptr, GPS_BESTEFFORT,
+                                                 IID_PPV_ARGS(&store))) || !store) return 0;
+    PROPVARIANT value{};
+    PropVariantInit(&value);
+    uint32_t ms = 0;
+    // 100 ns units; clamp to what fits the response (about 49 days).
+    if (SUCCEEDED(store->GetValue(PKEY_Media_Duration, &value)) && value.vt == VT_UI8)
+        ms = static_cast<uint32_t>((std::min)(value.uhVal.QuadPart / 10000ull, 0xFFFFFFFFull));
+    PropVariantClear(&value);
+    return ms;
 }
 
 } // namespace pulse::preview

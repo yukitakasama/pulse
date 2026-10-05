@@ -246,4 +246,14 @@ void Stop() {
     if (g_thread.joinable()) g_thread.join();
 }
 
+// Explicit in-process probes reuse the allocation-free suspended stack walker.
+std::wstring ThreadStackForProbe(DWORD tid) {
+    if (tid == GetCurrentThreadId()) return {};
+    ThreadStack stack;
+    if (!SampleThread(tid, stack)) return {};
+    std::wstring text;
+    for (size_t i = 0; i < stack.count; ++i) text += FrameText(stack.frames[i]) + L"\n";
+    return text;
+}
+
 } // namespace pulse::app::hang

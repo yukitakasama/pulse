@@ -95,6 +95,7 @@ struct Tab {
     size_t directory_count = 0;
     size_t file_count = 0;
     std::wstring pending_selected_name;
+    std::wstring pending_preview_rename;
     std::vector<std::wstring> pending_selected_names;
     bool pending_ensure_selection_visible = false;
     // File Explorer order hold (#13): change patches and non-explicit
@@ -378,6 +379,11 @@ struct LayoutTab {
     const Pane* FocusedPane() const;
     Tab* ActiveFolder();
     const Tab* ActiveFolder() const;
+    std::vector<Pane*> VisiblePanes() const {
+        std::vector<Pane*> result;
+        if (root) root->CollectPanes(result);
+        return result;
+    }
 };
 
 struct WindowTabs {
@@ -392,6 +398,14 @@ struct WindowTabs {
     void EnsureDefault();
     LayoutTab& NewTab(const std::wstring& path);
     LayoutTab& NewTabAt(size_t index, const std::wstring& path);
+    // Empty is an explicit This PC location, not an omitted default folder.
+    LayoutTab& NewTabAtLocation(size_t index, const std::wstring& path) {
+        auto& created = NewTabAt(index, path);
+        if (path.empty()) {
+            if (auto* folder = created.ActiveFolder()) folder->current_path.clear();
+        }
+        return created;
+    }
     void CloseTab(size_t idx);
     void SwitchTab(size_t idx);
     void MoveTab(size_t from, size_t to);
@@ -409,6 +423,7 @@ void FillWindowTabStrip(ui::WindowViewModel& vm, const WindowTabs& tabs);
 // contiguous (TabGroup::ListTabs contract); call after membership changes
 // that can split a run. Remaps WindowTabs::active by pointer identity.
 void NormalizeGroupRuns(WindowTabs& tabs);
+bool SetTabGroup(WindowTabs& tabs, size_t index, int group);
 
 // ---------------------------------------------------------------------------
 // Staging tray: collect file paths into batches.
@@ -522,6 +537,7 @@ std::vector<int> DefaultSidebarOrder();
 int SidebarSectionIndex(const ui::WindowViewModel& vm, int section_id);
 
 struct SidebarModel {
+    std::vector<SidebarEntry> system_networks;
     std::vector<SidebarEntry> quick_access;
     std::vector<SidebarEntry> saved_searches;
     std::vector<SidebarEntry> drives;
@@ -530,6 +546,8 @@ struct SidebarModel {
 };
 
 SidebarModel BuildSidebarModel(const fs::RecycleBinInfo* recycle = nullptr);
+// Blocking volume queries: call only on a background worker.
+void RefreshSidebarDriveCapacity(std::vector<SidebarEntry>& drives);
 
 // ---------------------------------------------------------------------------
 // View-model builders.

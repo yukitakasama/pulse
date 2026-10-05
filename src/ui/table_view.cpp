@@ -98,11 +98,17 @@ D2D1_RECT_F R(float l, float t, float r, float b) { return D2D1::RectF(l, t, r, 
 // ---------------------------------------------------------------- payload
 
 bool TableView::SetPayload(const std::wstring& payload) {
-    if (payload == payload_ && !sheets_.empty()) return true;
+    if (payload == payload_ && !sheets_.empty()) {
+        if (lazy_sheets_ && sheet_ == response_sheet_)
+            awaiting_sheet_ = pending_sheet_request_ = false;
+        return true;
+    }
     if (payload.rfind(L"PULSETBL\t1\n", 0) != 0) return false;
     std::vector<Sheet> sheets;
     std::wstring source;
     bool spreadsheet = false;
+    size_t total_sheets = 0, loaded_sheets = 0, selected_sheet = 0;
+    bool lazy_sheets = false;
     size_t pos = payload.find(L'\n') + 1;
     while (pos < payload.size()) {
         size_t end = payload.find(L'\n', pos);
@@ -141,16 +147,35 @@ bool TableView::SetPayload(const std::wstring& payload) {
             }
             sheet.cells.push_back(std::move(row));
             sheet.flags.push_back(std::move(flags));
+        } else if (line[0] == L'W') {
+            const auto f = Split(line.substr(2), L'\t');
+            if (f.size() >= 2) { total_sheets = ToSize(f[0]); loaded_sheets = ToSize(f[1]); }
+            if (f.size() >= 3) { selected_sheet = ToSize(f[2]); lazy_sheets = true; }
         } else if (line[0] == L'X') {
             source = Unescape(line.substr(2), nullptr);
         }
     }
     if (sheets.empty()) return false;
+    if (selected_sheet >= sheets.size()) return false;
+    // A response for a superseded sheet must not undo a more recent switch.
+    // File changes are separated by Clear(); compare names as an additional
+    // guard against treating a different workbook as an in-flight response.
+    if (lazy_sheets && lazy_sheets_ && sheets.size() == sheets_.size()) {
+        bool same_workbook = true;
+        for (size_t i = 0; i < sheets.size(); ++i)
+            if (sheets[i].name != sheets_[i].name) { same_workbook = false; break; }
+        if (same_workbook && selected_sheet != sheet_) return true;
+    }
     payload_ = payload;
     sheets_ = std::move(sheets);
     source_ = std::move(source);
     spreadsheet_ = spreadsheet;
-    sheet_ = 0;
+    total_sheets_ = total_sheets ? total_sheets : sheets_.size();
+    loaded_sheets_ = total_sheets ? loaded_sheets : sheets_.size();
+    sheet_ = selected_sheet;
+    response_sheet_ = selected_sheet;
+    lazy_sheets_ = lazy_sheets;
+    awaiting_sheet_ = pending_sheet_request_ = false;
     sel_valid_ = false;
     drag_ = Drag::None;
     hover_tab_ = tip_row_ = tip_col_ = -1;
@@ -164,8 +189,12 @@ void TableView::Clear() {
     source_.clear();
     plain_.clear();
     sheets_.clear();
+    total_sheets_ = loaded_sheets_ = 0;
+    lazy_sheets_ = awaiting_sheet_ = pending_sheet_request_ = false;
+    spreadsheet_ = false;
     row_offsets_.clear();
     sheet_ = 0;
+    response_sheet_ = 0;
     sel_valid_ = false;
     drag_ = Drag::None;
     hover_tab_ = tip_row_ = tip_col_ = -1;
@@ -397,11 +426,24 @@ void TableView::Draw(ID2D1DeviceContext* dc, IDWriteFactory2* factory, const D2D
 
     dc->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     if (s.cols == 0 || s.cells.empty()) {
-        const std::wstring empty = pulse::l10n::Pick(L"\x7A7A\x5DE5\x4F5C\x8868", L"Empty sheet");
+        std::wstring empty = pulse::l10n::Pick(L"\x7A7A\x5DE5\x4F5C\x8868", L"Empty sheet");
+        if (spreadsheet_ && !s.detail.empty()) {
+            if (awaiting_sheet_) empty = pulse::l10n::Pick(L"正在加载工作表…", L"Loading sheet…");
+            else if (s.detail == L"hidden") empty = pulse::l10n::Pick(L"隐藏的工作表；请在原应用中查看", L"Hidden sheet; open in the original app");
+            else if (s.detail == L"not-loaded") empty = pulse::l10n::Pick(L"选择工作表后按需加载", L"Select a sheet to load its content");
+            else if (s.detail == L"time-limit") empty = pulse::l10n::Pick(L"未读取：已达到预览时间上限", L"Not loaded: preview time limit reached");
+            else if (s.detail == L"payload-limit") empty = pulse::l10n::Pick(L"未读取：已达到预览容量上限", L"Not loaded: preview size limit reached");
+            else if (s.detail == L"missing-relationship") empty = pulse::l10n::Pick(L"未读取：工作表引用缺失", L"Not loaded: missing worksheet relationship");
+            else empty = pulse::l10n::Pick(L"未读取：工作表内容读取失败", L"Not loaded: worksheet content could not be read");
+        } else if (spreadsheet_ && s.truncated) {
+            empty = pulse::l10n::Pick(L"没有可显示的单元格：预览内容已截断", L"No cells available: preview content was truncated");
+        }
         text_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        text_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
         b->SetColor(theme.text_secondary);
         dc->DrawTextW(empty.data(), static_cast<UINT32>(empty.size()), text_.Get(), g.grid, b);
         text_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        text_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     }
 
     // Visible ranges.
@@ -560,24 +602,41 @@ void TableView::Draw(ID2D1DeviceContext* dc, IDWriteFactory2* factory, const D2D
         dc->DrawLine(D2D1::Point2F(g.tabs.left, g.tabs.top + 0.5f), D2D1::Point2F(g.tabs.right, g.tabs.top + 0.5f), b, 1.0f);
         // Size on the right.
         const bool zh = Zh();
-        std::wstring size = zh ? Grouped(BodyRows()) + pulse::l10n::Cn(L" \x884C \x00D7 ") + Grouped(s.cols) + pulse::l10n::Cn(L" \x5217")
-                               : Grouped(BodyRows()) + L" rows \x00D7 " + Grouped(s.cols) + L" columns";
-        if (s.truncated) size += pulse::l10n::Pick(L"\xFF08\x5DF2\x622A\x65AD\xFF09", L" (truncated)");
+        std::wstring size = std::to_wstring(sheet_ + 1) + L"/" + std::to_wstring(total_sheets_) +
+            (zh ? L" 表 · 已读取 " : L" sheets · read ") + std::to_wstring(loaded_sheets_);
+        if (sheets_.size() < total_sheets_)
+            size += zh ? L" · 列表已截断（容量上限）" : L" · list capped (size limit)";
+        if (s.truncated) size += pulse::l10n::Pick(L" · 内容不完整", L" · incomplete");
         WrlPtr<IDWriteTextLayout> size_layout;
-        factory->CreateTextLayout(size.data(), static_cast<UINT32>(size.size()), small_.Get(), 4000.0f, 30.0f * k, &size_layout);
+        const float status_width = (std::max)(1.0f, (g.tabs.right - g.tabs.left - 100.0f * k) * 0.55f);
+        factory->CreateTextLayout(size.data(), static_cast<UINT32>(size.size()), small_.Get(), status_width, 30.0f * k, &size_layout);
         float size_w = 0.0f;
         if (size_layout) {
+            size_layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            WrlPtr<IDWriteInlineObject> ellipsis;
+            factory->CreateEllipsisTrimmingSign(small_.Get(), &ellipsis);
+            const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+            size_layout->SetTrimming(&trimming, ellipsis.Get());
             DWRITE_TEXT_METRICS m{};
             size_layout->GetMetrics(&m);
-            size_w = m.width;
+            size_w = (std::min)(m.width, (std::max)(0.0f, (g.tabs.right - g.tabs.left - 100.0f * k) * 0.55f));
             b->SetColor(dim);
+            dc->PushAxisAlignedClip(R(g.tabs.right - 14.0f * k - size_w, g.tabs.top,
+                                     g.tabs.right - 14.0f * k, g.tabs.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
             dc->DrawTextLayout(D2D1::Point2F(g.tabs.right - 14.0f * k - size_w,
                                              (g.tabs.top + g.tabs.bottom) * 0.5f - 15.0f * k), size_layout.Get(), b);
+            dc->PopAxisAlignedClip();
         }
-        float x = g.tabs.left + 10.0f * k;
-        const float limit = g.tabs.right - size_w - 28.0f * k;
-        dc->PushAxisAlignedClip(R(g.tabs.left, g.tabs.top, (std::max)(g.tabs.left, limit), g.tabs.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
-        for (size_t i = 0; i < sheets_.size(); ++i) {
+        previous_sheet_ = R(g.tabs.left + 4.0f * k, g.tabs.top, g.tabs.left + 30.0f * k, g.tabs.bottom);
+        next_sheet_ = R(g.tabs.left + 30.0f * k, g.tabs.top, g.tabs.left + 56.0f * k, g.tabs.bottom);
+        b->SetColor(sheet_ > 0 ? theme.text : dim);
+        dc->DrawTextW(L"‹", 1, text_.Get(), previous_sheet_, b);
+        b->SetColor(sheet_ + 1 < sheets_.size() ? theme.text : dim);
+        dc->DrawTextW(L"›", 1, text_.Get(), next_sheet_, b);
+        float x = g.tabs.left + 60.0f * k;
+        const float limit = (std::max)(x, g.tabs.right - size_w - 28.0f * k);
+        dc->PushAxisAlignedClip(R(x, g.tabs.top, limit, g.tabs.bottom), D2D1_ANTIALIAS_MODE_ALIASED);
+        for (size_t i = sheet_; i < sheets_.size() && x < limit; ++i) {
             const bool on = i == sheet_;
             WrlPtr<IDWriteTextLayout> layout;
             const std::wstring& name = sheets_[i].name;
@@ -591,8 +650,8 @@ void TableView::Draw(ID2D1DeviceContext* dc, IDWriteFactory2* factory, const D2D
             layout->GetMetrics(&m);
             const float w = (std::min)(m.width, 240.0f * k) + 24.0f * k;
             const D2D1_RECT_F tab = R(x, g.tabs.top + 6.0f * k, x + w, g.tabs.bottom - 5.0f * k);
-            tab_rects_.push_back(tab);
-            if (on || static_cast<int>(i) == hover_tab_) {
+            tab_rects_.push_back(R(tab.left, tab.top, (std::min)(tab.right, limit), tab.bottom));
+            if (on || static_cast<int>(i - sheet_) == hover_tab_) {
                 b->SetColor(on ? (dark ? D2D1::ColorF(1, 1, 1, 0.09f) : HexColor(0xFFFFFF))
                                : (dark ? D2D1::ColorF(1, 1, 1, 0.05f) : D2D1::ColorF(0, 0, 0, 0.04f)));
                 dc->FillRoundedRectangle(D2D1::RoundedRect(tab, 5.0f * k, 5.0f * k), b);
@@ -670,6 +729,11 @@ void TableView::EnsureVisible(int row, int col) {
 bool TableView::Key(UINT vk, bool shift, bool ctrl) {
     Sheet* s = Current();
     if (!s) return false;
+    if (spreadsheet_ && ctrl && (vk == VK_PRIOR || vk == VK_NEXT)) {
+        if (vk == VK_PRIOR && sheet_ > 0) SwitchSheet(sheet_ - 1);
+        if (vk == VK_NEXT && sheet_ + 1 < sheets_.size()) SwitchSheet(sheet_ + 1);
+        return true;
+    }
     const Geometry g = Measure();
     const float page = (std::max)(g.row_h, g.body.bottom - g.body.top - g.row_h);
     const int rows = static_cast<int>(BodyRows()), cols = static_cast<int>(s->cols);
@@ -766,10 +830,28 @@ bool TableView::CellAt(float x, float y, int& row, int& col, bool clamp) const {
 void TableView::SwitchSheet(size_t index) {
     if (index >= sheets_.size() || index == sheet_) return;
     sheet_ = index;
+    const auto& detail = sheets_[sheet_].detail;
+    awaiting_sheet_ = lazy_sheets_ && (detail == L"not-loaded" || detail == L"read-failed" ||
+        detail == L"time-limit" || detail == L"payload-limit");
+    pending_sheet_request_ = awaiting_sheet_;
     sel_valid_ = false;
     tip_row_ = tip_col_ = -1;
     tip_shown_ = false;
     BuildPlain();
+}
+
+bool TableView::TakePendingSheetRequest(uint32_t& index) {
+    if (!pending_sheet_request_) return false;
+    index = static_cast<uint32_t>(sheet_);
+    pending_sheet_request_ = false;
+    return true;
+}
+
+void TableView::FailPendingSheetRequest(uint32_t index) {
+    if (index != sheet_ || !awaiting_sheet_) return;
+    awaiting_sheet_ = pending_sheet_request_ = false;
+    sheets_[sheet_].detail = L"read-failed";
+    sheets_[sheet_].truncated = true;
 }
 
 bool TableView::MouseDown(float x, float y, bool shift) {
@@ -780,8 +862,16 @@ bool TableView::MouseDown(float x, float y, bool shift) {
     };
     tip_row_ = tip_col_ = -1;
     tip_shown_ = false;
+    if (spreadsheet_ && inside(previous_sheet_, 0.0f)) {
+        if (sheet_ > 0) SwitchSheet(sheet_ - 1);
+        return true;
+    }
+    if (spreadsheet_ && inside(next_sheet_, 0.0f)) {
+        if (sheet_ + 1 < sheets_.size()) SwitchSheet(sheet_ + 1);
+        return true;
+    }
     for (size_t i = 0; i < tab_rects_.size(); ++i)
-        if (inside(tab_rects_[i], 0.0f)) { SwitchSheet(i); return true; }
+        if (inside(tab_rects_[i], 0.0f)) { SwitchSheet(sheet_ + i); return true; }
     const Geometry g = Measure();
     if (spreadsheet_ && y >= g.tabs.top) return true;
     if (vthumb_.bottom > vthumb_.top && inside(vthumb_, 4.0f * scale_)) {
